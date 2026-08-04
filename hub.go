@@ -16,6 +16,7 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"nhooyr.io/websocket"
@@ -53,29 +54,46 @@ type deviceInfo struct {
 type device struct {
 	ID         string
 	Name       string
-	Capability string
 	State      string // connecting | live
 	PC         *webrtc.PeerConnection
-	Remote     *webrtc.TrackRemote
-	Local      *webrtc.TrackLocalStaticRTP
-	Mime       string
+	HasVideo   bool
+	HasAudio   bool
+	VideoRemote *webrtc.TrackRemote
+	VideoLocal  *webrtc.TrackLocalStaticRTP
+	VideoMime   string
+	AudioRemote *webrtc.TrackRemote
+	AudioRate   uint32
+	AudioChans  uint16
+}
+
+func (d *device) capability() string {
+	switch {
+	case d.HasVideo && d.HasAudio:
+		return "av"
+	case d.HasAudio:
+		return "audio"
+	default:
+		return "video"
+	}
 }
 
 type Hub struct {
-	api        *webrtc.API
-	v4l2Device string
-	pairCode   string
+	api         *webrtc.API
+	v4l2Device  string
+	audioDest   string
+	pairCode    string
 
 	mu          sync.Mutex
 	devices     map[string]*device
 	activeID    string
 	vcam        *vcam
+	asink       *asink
 	controlPC   *webrtc.PeerConnection
 	controlSend func(signalMsg)
 	controlGen  int
 }
 
-func newHub(v4l2Device, pairCode string) (*Hub, error) {
+func newHub(v4l2Device, audioDest, pairCode string) (*Hub, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, err
@@ -114,6 +132,7 @@ func newHub(v4l2Device, pairCode string) (*Hub, error) {
 	return &Hub{
 		api:        api,
 		v4l2Device: v4l2Device,
+		audioDest:  audioDest,
 		pairCode:   pairCode,
 		devices:    make(map[string]*device),
 	}, nil
@@ -194,11 +213,10 @@ func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.C
 	}
 
 	dev := &device{
-		ID:         id,
-		Name:       name,
-		Capability: "video",
-		State:      "connecting",
-		PC:         pc,
+		ID:    id,
+		Name:  name,
+		State: "connecting",
+		PC:    pc,
 	}
 
 	h.mu.Lock()
@@ -213,6 +231,11 @@ func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.C
 	}()
 
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionRecvonly,
+	}); err != nil {
+		return err
+	}
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
 	}); err != nil {
 		return err
@@ -239,75 +262,11 @@ func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.C
 	})
 
 	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-		if remote.Kind() != webrtc.RTPCodecTypeVideo {
-			return
-		}
-		mime := remote.Codec().MimeType
-		log.Printf("phone %s track: %s", id, mime)
-
-		local, err := webrtc.NewTrackLocalStaticRTP(
-			remote.Codec().RTPCodecCapability,
-			"video",
-			id,
-		)
-		if err != nil {
-			log.Printf("local track: %v", err)
-			return
-		}
-
-		h.mu.Lock()
-		d := h.devices[id]
-		if d == nil {
-			h.mu.Unlock()
-			return
-		}
-		d.Remote = remote
-		d.Local = local
-		d.Mime = mime
-		d.State = "live"
-		becameActive := false
-		if h.activeID == "" {
-			h.activeID = id
-			becameActive = true
-		}
-		isActive := h.activeID == id
-		h.mu.Unlock()
-
-		h.broadcastDevices()
-		if becameActive {
-			h.restartVCamForActive()
-		}
-		if isActive || becameActive {
-			h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
-		}
-
-		_ = pc.WriteRTCP([]rtcp.Packet{
-			&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())},
-		})
-		go pliLoop(ctx, pc, remote)
-
-		h264 := &codecs.H264Packet{}
-		for {
-			pkt, _, readErr := remote.ReadRTP()
-			if readErr != nil {
-				return
-			}
-
-			raw, mErr := pkt.Marshal()
-			if mErr == nil {
-				if _, err := local.Write(raw); err != nil && !errors.Is(err, io.ErrClosedPipe) {
-					return
-				}
-			}
-
-			if !strings.Contains(strings.ToLower(mime), "h264") {
-				continue
-			}
-			nal, uErr := h264.Unmarshal(pkt.Payload)
-			if uErr != nil || len(nal) == 0 {
-				continue
-			}
-			h.writeVCam(id, nal)
+		switch remote.Kind() {
+		case webrtc.RTPCodecTypeVideo:
+			h.handleVideoTrack(ctx, id, pc, remote)
+		case webrtc.RTPCodecTypeAudio:
+			h.handleAudioTrack(ctx, id, remote)
 		}
 	})
 
@@ -325,6 +284,132 @@ func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.C
 		if err := h.handlePhoneSignal(pc, msg, send); err != nil {
 			return err
 		}
+	}
+}
+
+func (h *Hub) handleVideoTrack(ctx context.Context, id string, pc *webrtc.PeerConnection, remote *webrtc.TrackRemote) {
+	mime := remote.Codec().MimeType
+	log.Printf("phone %s video: %s", id, mime)
+
+	local, err := webrtc.NewTrackLocalStaticRTP(
+		remote.Codec().RTPCodecCapability,
+		"video",
+		id,
+	)
+	if err != nil {
+		log.Printf("local track: %v", err)
+		return
+	}
+
+	h.mu.Lock()
+	d := h.devices[id]
+	if d == nil {
+		h.mu.Unlock()
+		return
+	}
+	d.VideoRemote = remote
+	d.VideoLocal = local
+	d.VideoMime = mime
+	d.HasVideo = true
+	d.State = "live"
+	becameActive := false
+	if h.activeID == "" {
+		h.activeID = id
+		becameActive = true
+	}
+	isActive := h.activeID == id
+	h.mu.Unlock()
+
+	h.broadcastDevices()
+	if becameActive {
+		h.restartVCamForActive()
+		h.restartAudioForActive()
+	}
+	if isActive || becameActive {
+		h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
+	}
+
+	_ = pc.WriteRTCP([]rtcp.Packet{
+		&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())},
+	})
+	go pliLoop(ctx, pc, remote)
+
+	h264 := &codecs.H264Packet{}
+	for {
+		pkt, _, readErr := remote.ReadRTP()
+		if readErr != nil {
+			return
+		}
+
+		raw, mErr := pkt.Marshal()
+		if mErr == nil {
+			if _, err := local.Write(raw); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				return
+			}
+		}
+
+		if !strings.Contains(strings.ToLower(mime), "h264") {
+			continue
+		}
+		nal, uErr := h264.Unmarshal(pkt.Payload)
+		if uErr != nil || len(nal) == 0 {
+			continue
+		}
+		h.writeVCam(id, nal)
+	}
+}
+
+func (h *Hub) handleAudioTrack(_ context.Context, id string, remote *webrtc.TrackRemote) {
+	mime := remote.Codec().MimeType
+	rate := remote.Codec().ClockRate
+	if rate == 0 {
+		rate = 48000
+	}
+	chans := remote.Codec().Channels
+	if chans == 0 {
+		chans = 2
+	}
+	log.Printf("phone %s audio: %s (%d Hz, %d ch)", id, mime, rate, chans)
+
+	h.mu.Lock()
+	d := h.devices[id]
+	if d == nil {
+		h.mu.Unlock()
+		return
+	}
+	d.AudioRemote = remote
+	d.AudioRate = rate
+	d.AudioChans = chans
+	d.HasAudio = true
+	d.State = "live"
+	becameActive := false
+	if h.activeID == "" {
+		h.activeID = id
+		becameActive = true
+	}
+	isActive := h.activeID == id
+	hasVideo := d.HasVideo
+	h.mu.Unlock()
+
+	h.broadcastDevices()
+	if becameActive {
+		h.restartVCamForActive()
+		h.restartAudioForActive()
+		if hasVideo {
+			h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
+		} else {
+			h.notifyControl(signalMsg{Type: "status", Message: "audio-only"})
+		}
+	} else if isActive {
+		h.restartAudioForActive()
+	}
+
+	for {
+		pkt, _, readErr := remote.ReadRTP()
+		if readErr != nil {
+			return
+		}
+		h.writeAudio(id, pkt)
 	}
 }
 
@@ -537,7 +622,7 @@ func (h *Hub) attachTrack(pc *webrtc.PeerConnection, track *webrtc.TrackLocalSta
 func (h *Hub) setActive(id string) error {
 	h.mu.Lock()
 	d, ok := h.devices[id]
-	if !ok || d.State != "live" || d.Local == nil {
+	if !ok || d.State != "live" || (!d.HasVideo && !d.HasAudio) {
 		h.mu.Unlock()
 		return fmt.Errorf("device %s not available", id)
 	}
@@ -547,21 +632,25 @@ func (h *Hub) setActive(id string) error {
 		return nil
 	}
 	h.activeID = id
-	h.mu.Unlock()
-
-	log.Printf("active → %s (%s)", id, d.Name)
-	h.restartVCamForActive()
-	h.broadcastDevices()
-	h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
-
-	h.mu.Lock()
-	remote := d.Remote
+	hasVideo := d.HasVideo
+	videoRemote := d.VideoRemote
 	pc := d.PC
+	name := d.Name
 	h.mu.Unlock()
-	if remote != nil && pc != nil {
-		_ = pc.WriteRTCP([]rtcp.Packet{
-			&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())},
-		})
+
+	log.Printf("active → %s (%s)", id, name)
+	h.restartVCamForActive()
+	h.restartAudioForActive()
+	h.broadcastDevices()
+	if hasVideo {
+		h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
+		if videoRemote != nil && pc != nil {
+			_ = pc.WriteRTCP([]rtcp.Packet{
+				&rtcp.PictureLossIndication{MediaSSRC: uint32(videoRemote.SSRC())},
+			})
+		}
+	} else {
+		h.notifyControl(signalMsg{Type: "status", Message: "audio-only"})
 	}
 	return nil
 }
@@ -576,12 +665,15 @@ func (h *Hub) removeDevice(id string) {
 	delete(h.devices, id)
 	wasActive := h.activeID == id
 	var next string
+	var nextHasVideo bool
 	if wasActive {
 		h.activeID = ""
 		h.stopVCamLocked()
+		h.stopAudioLocked()
 		for _, other := range h.devices {
-			if other.State == "live" && other.Local != nil {
+			if other.State == "live" && (other.HasVideo || other.HasAudio) {
 				next = other.ID
+				nextHasVideo = other.HasVideo
 				break
 			}
 		}
@@ -595,7 +687,12 @@ func (h *Hub) removeDevice(id string) {
 		if next != "" {
 			log.Printf("active failover → %s", next)
 			h.restartVCamForActive()
-			h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
+			h.restartAudioForActive()
+			if nextHasVideo {
+				h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
+			} else {
+				h.notifyControl(signalMsg{Type: "status", Message: "audio-only"})
+			}
 		} else {
 			h.notifyControl(signalMsg{Type: "status", Message: "waiting-for-phone"})
 		}
@@ -610,13 +707,13 @@ func (h *Hub) restartVCamForActive() {
 	devPath := h.v4l2Device
 	var mime string
 	if id != "" {
-		if d := h.devices[id]; d != nil {
-			mime = d.Mime
+		if d := h.devices[id]; d != nil && d.HasVideo {
+			mime = d.VideoMime
 		}
 	}
 	h.mu.Unlock()
 
-	if id == "" || devPath == "" {
+	if id == "" || devPath == "" || mime == "" {
 		return
 	}
 	if !strings.Contains(strings.ToLower(mime), "h264") {
@@ -640,10 +737,54 @@ func (h *Hub) restartVCamForActive() {
 	h.mu.Unlock()
 }
 
+func (h *Hub) restartAudioForActive() {
+	h.mu.Lock()
+	h.stopAudioLocked()
+	id := h.activeID
+	dest := h.audioDest
+	var rate uint32
+	var chans uint16
+	hasAudio := false
+	if id != "" {
+		if d := h.devices[id]; d != nil && d.HasAudio {
+			hasAudio = true
+			rate = d.AudioRate
+			chans = d.AudioChans
+		}
+	}
+	h.mu.Unlock()
+
+	if id == "" || dest == "" || !hasAudio {
+		return
+	}
+
+	sink, err := startASink(dest, rate, chans)
+	if err != nil {
+		log.Printf("asink: %v", err)
+		return
+	}
+
+	h.mu.Lock()
+	if h.activeID != id {
+		h.mu.Unlock()
+		sink.Close()
+		return
+	}
+	h.asink = sink
+	h.mu.Unlock()
+}
+
 func (h *Hub) stopVCamLocked() {
 	if h.vcam != nil {
 		h.vcam.Close()
 		h.vcam = nil
+	}
+}
+
+func (h *Hub) stopAudioLocked() {
+	if h.asink != nil {
+		h.asink.Close()
+		h.asink = nil
 	}
 }
 
@@ -666,6 +807,25 @@ func (h *Hub) writeVCam(deviceID string, nal []byte) {
 	}
 }
 
+func (h *Hub) writeAudio(deviceID string, pkt *rtp.Packet) {
+	h.mu.Lock()
+	if h.activeID != deviceID || h.asink == nil {
+		h.mu.Unlock()
+		return
+	}
+	sink := h.asink
+	h.mu.Unlock()
+
+	if err := sink.WriteRTP(pkt); err != nil {
+		log.Printf("asink write: %v", err)
+		h.mu.Lock()
+		if h.asink == sink {
+			h.stopAudioLocked()
+		}
+		h.mu.Unlock()
+	}
+}
+
 func (h *Hub) activeLocalLocked() *webrtc.TrackLocalStaticRTP {
 	if h.activeID == "" {
 		return nil
@@ -674,7 +834,7 @@ func (h *Hub) activeLocalLocked() *webrtc.TrackLocalStaticRTP {
 	if d == nil {
 		return nil
 	}
-	return d.Local
+	return d.VideoLocal
 }
 
 func (h *Hub) snapshotDevices() []deviceInfo {
@@ -685,7 +845,7 @@ func (h *Hub) snapshotDevices() []deviceInfo {
 		out = append(out, deviceInfo{
 			ID:         d.ID,
 			Name:       d.Name,
-			Capability: d.Capability,
+			Capability: d.capability(),
 			State:      d.State,
 			Active:     d.ID == h.activeID,
 		})

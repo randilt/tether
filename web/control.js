@@ -197,6 +197,23 @@
         setStatus("Waiting for phone to start…", "wait");
         return;
       }
+      if (msg.message === "audio-only") {
+        stopStats();
+        if (pc) {
+          pc.close();
+          pc = null;
+        }
+        remote.srcObject = null;
+        statsEl.textContent = "";
+        const active = devices.find((d) => d.active);
+        setStatus(
+          active
+            ? `Active mic — ${active.name} (listen on PC speakers / audio sink)`
+            : "Active mic — listen on PC speakers / audio sink",
+          "live",
+        );
+        return;
+      }
       if (msg.message === "track-ready") {
         setStatus("Active track ready — connecting…", "wait");
         createPC();

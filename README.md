@@ -1,7 +1,8 @@
 # Tether
 
-Phone browser → WebRTC → Linux PC virtual webcam (`v4l2loopback`) + browser preview.
+Phone browser → WebRTC → Linux PC virtual webcam (`v4l2loopback`) and/or mic audio.
 Multiple phones can connect; the control page picks which one is active.
+Capabilities per device: `video`, `audio`, or `av`.
 
 ## Requirements
 
@@ -9,6 +10,7 @@ Multiple phones can connect; the control page picks which one is active.
 - `ffmpeg` on PATH
 - Linux PC and phone on the same Wi‑Fi/LAN
 - Phone browser with `getUserMedia` + WebRTC (Safari on iOS is fine)
+- For hearing mic audio: PulseAudio/PipeWire (`-audio pulse:default`, the default) or ALSA
 
 ## One-time: v4l2loopback
 
@@ -35,12 +37,29 @@ echo 'options v4l2loopback devices=1 video_nr=10 card_label=Tether exclusive_cap
   | sudo tee /etc/modprobe.d/v4l2loopback.conf
 ```
 
+## Optional: ALSA loopback (virtual mic for apps)
+
+Default audio plays to speakers via Pulse (`pulse:default`) so you can hear the phone.
+To expose the phone as a **system microphone** (Zoom/OBS/etc.):
+
+```bash
+sudo modprobe snd-aloop
+# list cards: aplay -l   → look for "Loopback"
+go run . -audio alsa:hw:Loopback,0,0
+```
+
+Then in your app, pick the Loopback **capture** device (often `hw:Loopback,1,0` / “Loopback” mic). Playback goes to `,0,0`; apps record from `,1,0`.
+
 ## Run
 
 ```bash
-go run .                  # default virtual cam: /dev/video10
+go run .                              # cam /dev/video10 + audio pulse:default
 go run . -v4l2 /dev/video2
-go run . -v4l2 ''         # browser preview only, no v4l2
+go run . -v4l2 ''                     # no virtual cam
+go run . -audio pulse:default         # hear mic on PC (default)
+go run . -audio alsa:default
+go run . -audio alsa:hw:Loopback,0,0  # virtual mic via snd-aloop
+go run . -audio ''                    # disable audio sink
 ```
 
 Listens on `https://0.0.0.0:8443` (`-addr` to change). First start writes a self-signed CA + cert to `certs/` (gitignored).
@@ -48,7 +67,7 @@ Listens on `https://0.0.0.0:8443` (`-addr` to change). First start writes a self
 | Page | Path |
 |------|------|
 | PC control (preview) | `/control` |
-| Phone camera | `/phone` |
+| Phone (camera / mic / both) | `/phone` |
 | Cert download (iOS) | `/cert.cer` |
 
 ## Trust the cert on iPhone (once)
@@ -58,31 +77,33 @@ Listens on `https://0.0.0.0:8443` (`-addr` to change). First start writes a self
 1. iPhone Safari → `https://<pc-lan-ip>:8443/cert.cer` (accept the warning once to download).
 2. **Settings → Profile Downloaded** (or **General → VPN & Device Management**) → install **Tether Local CA**.
 3. **Settings → General → About → Certificate Trust Settings** → enable **Full Trust** for **Tether Local CA**.
-4. Quit Safari, open the **pairing URL** from the control page (includes `?t=…`), Start camera.
+4. Quit Safari, open the **pairing URL** from the control page (includes `?t=…`).
 
 If your LAN IP changes, `rm -rf certs`, restart, reinstall the CA.
 
-## Pairing (milestone 4)
+## Pairing
 
-On each server start a random 6-character code is generated (printed in the terminal and shown on `/control`).
+On each server start a random 6-character code is generated (terminal + `/control`).
 
 - Phone must use `/phone?t=CODE` (or enter the code on `/phone`).
 - WebSocket joins without a matching `t` get **403**.
 - Code lasts for the process lifetime — restart → new code.
+- Startup prints a **terminal QR** of the LAN phone URL (`github.com/mdp/qrterminal`).
 - This is LAN hygiene, not real auth.
 
-## Acceptance check
+## Acceptance check (milestone 5 — mic)
 
-1. Load v4l2loopback, start `go run .`, note the pairing code.
-2. Open `/control` — code + phone URL visible; copy URL to phone.
-3. Phone with URL connects as before (multi-device picker still works).
-4. Another device opening `/phone` without the code cannot start a session (WS rejected).
-5. Optional: two phones with `?t=CODE&name=Kitchen` etc., switch active on control.
+1. `go run .` (Pulse/PipeWire available).
+2. Pair phone → choose **Mic** → Start → allow microphone.
+3. Device list shows capability `audio`; make it active if needed.
+4. Speak into the phone — hear it on the PC speakers. Logs: `asink: ffmpeg → pulse:default`.
+
+Camera / multi-device / pairing still work as before (`video` / `av` capabilities).
 
 ## Notes
 
 - LAN-only: no STUN/TURN (`iceServers: []`).
-- No accounts/passwords — just a process-lifetime pairing token.
-- Virtual cam path is H264-only (iPhone Safari). Browser preview relays the active device’s codec.
-- ffmpeg uses low-latency flags (`nobuffer`, `low_delay`, tiny probesize/analyzeduration).
+- Active device drives both v4l2 (if it has video) and the audio sink (if it has audio).
+- Virtual cam path is H264-only (iPhone Safari).
+- Audio path: Opus RTP → Ogg → ffmpeg → Pulse/ALSA (low-latency flags).
 - **iPhone → Linux Chrome preview:** Chrome often can’t decode H264 → black `<video>`. Firefox usually works. OBS/Zoom use the v4l2 path.

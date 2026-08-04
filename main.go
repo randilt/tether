@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/mdp/qrterminal/v3"
 )
 
 //go:embed web/*
@@ -18,6 +20,7 @@ var webFS embed.FS
 func main() {
 	addr := flag.String("addr", ":8443", "HTTPS listen address")
 	v4l2 := flag.String("v4l2", "/dev/video10", "v4l2loopback device (empty disables virtual cam)")
+	audio := flag.String("audio", "pulse:default", "audio sink: pulse:default | alsa:default | alsa:hw:Loopback,0,0 | empty disables")
 	flag.Parse()
 
 	certPath, keyPath, err := ensureCert()
@@ -30,7 +33,7 @@ func main() {
 		log.Fatalf("pair code: %v", err)
 	}
 
-	hub, err := newHub(*v4l2, pairCode)
+	hub, err := newHub(*v4l2, *audio, pairCode)
 	if err != nil {
 		log.Fatalf("webrtc: %v", err)
 	}
@@ -53,7 +56,7 @@ func main() {
 		http.Redirect(w, r, "/control", http.StatusFound)
 	})
 
-	printURLs(*addr, *v4l2, pairCode)
+	printURLs(*addr, *v4l2, *audio, pairCode)
 	log.Printf("listening on https://%s", *addr)
 	if err := http.ListenAndServeTLS(*addr, certPath, keyPath, mux); err != nil {
 		log.Fatal(err)
@@ -83,7 +86,7 @@ func serveCertDER(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func printURLs(addr, v4l2Device, pairCode string) {
+func printURLs(addr, v4l2Device, audioDest, pairCode string) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		port = "8443"
@@ -93,12 +96,19 @@ func printURLs(addr, v4l2Device, pairCode string) {
 		host = "localhost"
 	}
 
+	lan := lanIPv4s()
+	scanHost := host
+	if len(lan) > 0 {
+		scanHost = lan[0]
+	}
+	phoneURL := fmt.Sprintf("https://%s:%s/phone?t=%s", scanHost, port, pairCode)
+
 	fmt.Println()
-	fmt.Println("Tether — phone → WebRTC → v4l2")
-	fmt.Println("────────────────────────────────")
+	fmt.Println("Tether — phone → WebRTC → v4l2 / audio")
+	fmt.Println("──────────────────────────────────────")
 	fmt.Printf("  Pairing code: %s\n", pairCode)
 	fmt.Printf("  PC control:   https://%s:%s/control\n", host, port)
-	fmt.Printf("  Phone (local): https://%s:%s/phone?t=%s\n", host, port, pairCode)
+	fmt.Printf("  Phone URL:    %s\n", phoneURL)
 	fmt.Printf("  Install cert: https://%s:%s/cert.cer\n", host, port)
 	if v4l2Device != "" {
 		fmt.Printf("  Virtual cam:  %s\n", v4l2Device)
@@ -108,12 +118,27 @@ func printURLs(addr, v4l2Device, pairCode string) {
 	} else {
 		fmt.Println("  Virtual cam:  disabled")
 	}
-
-	for _, ip := range lanIPv4s() {
-		fmt.Printf("  Phone (LAN):  https://%s:%s/phone?t=%s\n", ip, port, pairCode)
+	if audioDest != "" {
+		fmt.Printf("  Audio sink:   %s\n", audioDest)
+	} else {
+		fmt.Println("  Audio sink:   disabled")
 	}
+	for _, ip := range lan {
+		if ip == scanHost {
+			continue
+		}
+		fmt.Printf("  Phone (alt):  https://%s:%s/phone?t=%s\n", ip, port, pairCode)
+	}
+
 	fmt.Println()
-	fmt.Println("Phones need the pairing code (or this URL). Code lasts until restart.")
+	fmt.Println("Scan with phone camera (pairing URL):")
+	qrterminal.GenerateWithConfig(phoneURL, qrterminal.Config{
+		Level:      qrterminal.M,
+		Writer:     os.Stdout,
+		HalfBlocks: true,
+		QuietZone:  1,
+	})
+	fmt.Println("Phones need this URL/code. New code each restart.")
 	fmt.Println("First time on iPhone: open /cert.cer, install + Full Trust (see README).")
 	fmt.Println()
 }

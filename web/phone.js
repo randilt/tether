@@ -5,6 +5,7 @@
   const pairInput = document.getElementById("pair-input");
   const statusEl = document.getElementById("status");
   const preview = document.getElementById("preview");
+  const previewWrap = document.getElementById("preview-wrap");
   const startBtn = document.getElementById("start");
   const stopBtn = document.getElementById("stop");
 
@@ -16,6 +17,11 @@
   let localStream = null;
   let starting = false;
   let pairToken = "";
+
+  function selectedMode() {
+    const el = document.querySelector('input[name="mode"]:checked');
+    return el ? el.value : "video";
+  }
 
   function setStatus(text, state = "wait") {
     statusEl.textContent = text;
@@ -45,6 +51,17 @@
   function showGate() {
     gateEl.hidden = false;
     camEl.hidden = true;
+  }
+
+  function mediaConstraints(mode) {
+    const video = {
+      facingMode: { ideal: "environment" },
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+    };
+    if (mode === "audio") return { audio: true, video: false };
+    if (mode === "av") return { audio: true, video };
+    return { audio: false, video };
   }
 
   async function ensureWS() {
@@ -112,18 +129,15 @@
     if (starting) return;
     starting = true;
     startBtn.disabled = true;
+    const mode = selectedMode();
 
     try {
-      setStatus("Requesting camera…", "wait");
-      localStream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
-      });
-      preview.srcObject = localStream;
+      setStatus(mode === "audio" ? "Requesting microphone…" : "Requesting media…", "wait");
+      localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints(mode));
+
+      const hasVideo = localStream.getVideoTracks().length > 0;
+      previewWrap.hidden = !hasVideo;
+      preview.srcObject = hasVideo ? localStream : null;
 
       setStatus("Connecting…", "wait");
       await ensureWS();
@@ -145,8 +159,10 @@
 
       pc.onconnectionstatechange = () => {
         const s = pc.connectionState;
-        if (s === "connected") setStatus("Live — sending camera", "live");
-        else if (s === "failed") setStatus("WebRTC failed", "error");
+        if (s === "connected") {
+          const label = mode === "audio" ? "mic" : mode === "av" ? "camera + mic" : "camera";
+          setStatus(`Live — sending ${label}`, "live");
+        } else if (s === "failed") setStatus("WebRTC failed", "error");
         else if (s === "disconnected") setStatus("Disconnected", "error");
       };
 
@@ -155,6 +171,7 @@
       send({ type: "offer", sdp: offer.sdp });
 
       stopBtn.disabled = false;
+      document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = true; });
       setStatus("Negotiating…", "wait");
     } catch (err) {
       console.error(err);
@@ -173,6 +190,7 @@
       localStream = null;
     }
     preview.srcObject = null;
+    previewWrap.hidden = false;
     if (pc) {
       pc.close();
       pc = null;
@@ -181,6 +199,7 @@
       ws.close();
       ws = null;
     }
+    document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = false; });
     startBtn.disabled = false;
     setStatus("Stopped", "wait");
   }
