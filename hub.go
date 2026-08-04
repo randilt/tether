@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,28 +24,52 @@ import (
 type role string
 
 const (
-	rolePhone  role = "phone"
-	roleViewer role = "viewer"
+	rolePhone   role = "phone"
+	roleControl role = "control"
+	roleViewer  role = "viewer" // alias for control (M1/M2 clients)
 )
 
 type signalMsg struct {
-	Type       string `json:"type"`
-	SDP        string `json:"sdp,omitempty"`
-	Candidate  string `json:"candidate,omitempty"`
-	SDPMid     string `json:"sdpMid,omitempty"`
-	SDPMLineIx *int   `json:"sdpMLineIndex,omitempty"`
-	Message    string `json:"message,omitempty"`
+	Type       string       `json:"type"`
+	SDP        string       `json:"sdp,omitempty"`
+	Candidate  string       `json:"candidate,omitempty"`
+	SDPMid     string       `json:"sdpMid,omitempty"`
+	SDPMLineIx *int         `json:"sdpMLineIndex,omitempty"`
+	Message    string       `json:"message,omitempty"`
+	ID         string       `json:"id,omitempty"`
+	Devices    []deviceInfo `json:"devices,omitempty"`
+}
+
+type deviceInfo struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Capability string `json:"capability"`
+	State      string `json:"state"`
+	Active     bool   `json:"active"`
+}
+
+type device struct {
+	ID         string
+	Name       string
+	Capability string
+	State      string // connecting | live
+	PC         *webrtc.PeerConnection
+	Remote     *webrtc.TrackRemote
+	Local      *webrtc.TrackLocalStaticRTP
+	Mime       string
 }
 
 type Hub struct {
 	api        *webrtc.API
 	v4l2Device string
 
-	mu         sync.Mutex
-	localTrack *webrtc.TrackLocalStaticRTP
-	phonePC    *webrtc.PeerConnection
-	viewerPC   *webrtc.PeerConnection
-	viewerSend func(signalMsg) // set while viewer WS is live
+	mu          sync.Mutex
+	devices     map[string]*device
+	activeID    string
+	vcam        *vcam
+	controlPC   *webrtc.PeerConnection
+	controlSend func(signalMsg)
+	controlGen  int
 }
 
 func newHub(v4l2Device string) (*Hub, error) {
@@ -57,13 +83,12 @@ func newHub(v4l2Device string) (*Hub, error) {
 		return nil, err
 	}
 
-	// Skip docker/VM bridges so ICE prefers real LAN NICs (e.g. 192.168.x).
 	se := webrtc.SettingEngine{}
 	se.SetInterfaceFilter(func(name string) bool {
 		n := strings.ToLower(name)
 		switch {
 		case n == "docker0", n == "lo":
-			return n == "lo" // keep loopback for same-machine /control
+			return n == "lo"
 		case strings.HasPrefix(n, "br-"),
 			strings.HasPrefix(n, "veth"),
 			strings.HasPrefix(n, "virbr"),
@@ -83,14 +108,21 @@ func newHub(v4l2Device string) (*Hub, error) {
 		webrtc.WithSettingEngine(se),
 	)
 
-	return &Hub{api: api, v4l2Device: v4l2Device}, nil
+	return &Hub{
+		api:        api,
+		v4l2Device: v4l2Device,
+		devices:    make(map[string]*device),
+	}, nil
 }
 
 func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	rRole := role(r.URL.Query().Get("role"))
-	if rRole != rolePhone && rRole != roleViewer {
-		http.Error(w, "role must be phone or viewer", http.StatusBadRequest)
+	if rRole != rolePhone && rRole != roleControl && rRole != roleViewer {
+		http.Error(w, "role must be phone or control", http.StatusBadRequest)
 		return
+	}
+	if rRole == roleViewer {
+		rRole = roleControl
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -103,11 +135,14 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	ctx := r.Context()
+	var sendMu sync.Mutex
 	send := func(msg signalMsg) {
 		b, err := json.Marshal(msg)
 		if err != nil {
 			return
 		}
+		sendMu.Lock()
+		defer sendMu.Unlock()
 		writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := conn.Write(writeCtx, websocket.MessageText, b); err != nil {
@@ -117,38 +152,46 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	switch rRole {
 	case rolePhone:
-		if err := h.servePhone(ctx, conn, send); err != nil && !errors.Is(err, context.Canceled) {
+		if err := h.servePhone(ctx, r, conn, send); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("phone session: %v", err)
 			send(signalMsg{Type: "error", Message: err.Error()})
 		}
-	case roleViewer:
-		if err := h.serveViewer(ctx, conn, send); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("viewer session: %v", err)
+	case roleControl:
+		if err := h.serveControl(ctx, conn, send); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("control session: %v", err)
 			send(signalMsg{Type: "error", Message: err.Error()})
 		}
 	}
 }
 
-func (h *Hub) servePhone(ctx context.Context, conn *websocket.Conn, send func(signalMsg)) error {
+func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.Conn, send func(signalMsg)) error {
+	id, err := newDeviceID()
+	if err != nil {
+		return err
+	}
+	name := phoneName(r)
+
 	pc, err := h.api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return err
 	}
 
-	h.mu.Lock()
-	if h.phonePC != nil {
-		_ = h.phonePC.Close()
+	dev := &device{
+		ID:         id,
+		Name:       name,
+		Capability: "video",
+		State:      "connecting",
+		PC:         pc,
 	}
-	h.phonePC = pc
+
+	h.mu.Lock()
+	h.devices[id] = dev
 	h.mu.Unlock()
+	log.Printf("device + %s (%s)", id, name)
+	h.broadcastDevices()
 
 	defer func() {
-		h.mu.Lock()
-		if h.phonePC == pc {
-			h.phonePC = nil
-			h.localTrack = nil
-		}
-		h.mu.Unlock()
+		h.removeDevice(id)
 		_ = pc.Close()
 	}()
 
@@ -175,7 +218,7 @@ func (h *Hub) servePhone(ctx context.Context, conn *websocket.Conn, send func(si
 	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("phone peer state: %s", s)
+		log.Printf("phone %s peer state: %s", id, s)
 	})
 
 	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -183,12 +226,12 @@ func (h *Hub) servePhone(ctx context.Context, conn *websocket.Conn, send func(si
 			return
 		}
 		mime := remote.Codec().MimeType
-		log.Printf("phone track: %s %s", mime, remote.ID())
+		log.Printf("phone %s track: %s", id, mime)
 
 		local, err := webrtc.NewTrackLocalStaticRTP(
 			remote.Codec().RTPCodecCapability,
 			"video",
-			"tether",
+			id,
 		)
 		if err != nil {
 			log.Printf("local track: %v", err)
@@ -196,32 +239,35 @@ func (h *Hub) servePhone(ctx context.Context, conn *websocket.Conn, send func(si
 		}
 
 		h.mu.Lock()
-		h.localTrack = local
-		viewerSend := h.viewerSend
-		device := h.v4l2Device
+		d := h.devices[id]
+		if d == nil {
+			h.mu.Unlock()
+			return
+		}
+		d.Remote = remote
+		d.Local = local
+		d.Mime = mime
+		d.State = "live"
+		becameActive := false
+		if h.activeID == "" {
+			h.activeID = id
+			becameActive = true
+		}
+		isActive := h.activeID == id
 		h.mu.Unlock()
 
-		if viewerSend != nil {
-			viewerSend(signalMsg{Type: "status", Message: "track-ready"})
+		h.broadcastDevices()
+		if becameActive {
+			h.restartVCamForActive()
+		}
+		if isActive || becameActive {
+			h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
 		}
 
-		// Keyframes ASAP for ffmpeg (needs SPS/PPS) and late viewers.
 		_ = pc.WriteRTCP([]rtcp.Packet{
 			&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())},
 		})
 		go pliLoop(ctx, pc, remote)
-
-		var cam *vcam
-		if device != "" && strings.Contains(strings.ToLower(mime), "h264") {
-			cam, err = startVCam(device)
-			if err != nil {
-				log.Printf("vcam: %v", err)
-			} else {
-				defer cam.Close()
-			}
-		} else if device != "" {
-			log.Printf("vcam: skip — need H264 for pipe, got %s", mime)
-		}
 
 		h264 := &codecs.H264Packet{}
 		for {
@@ -237,22 +283,18 @@ func (h *Hub) servePhone(ctx context.Context, conn *websocket.Conn, send func(si
 				}
 			}
 
-			if cam == nil {
+			if !strings.Contains(strings.ToLower(mime), "h264") {
 				continue
 			}
 			nal, uErr := h264.Unmarshal(pkt.Payload)
 			if uErr != nil || len(nal) == 0 {
 				continue
 			}
-			if err := cam.Write(nal); err != nil {
-				log.Printf("vcam write: %v", err)
-				cam.Close()
-				cam = nil
-			}
+			h.writeVCam(id, nal)
 		}
 	})
 
-	send(signalMsg{Type: "status", Message: "ready"})
+	send(signalMsg{Type: "status", Message: "ready", ID: id})
 
 	for {
 		_, data, err := conn.Read(ctx)
@@ -305,30 +347,132 @@ func (h *Hub) handlePhoneSignal(pc *webrtc.PeerConnection, msg signalMsg, send f
 	return nil
 }
 
-func (h *Hub) serveViewer(ctx context.Context, conn *websocket.Conn, send func(signalMsg)) error {
-	pc, err := h.api.NewPeerConnection(webrtc.Configuration{})
-	if err != nil {
-		return err
-	}
-
+func (h *Hub) serveControl(ctx context.Context, conn *websocket.Conn, send func(signalMsg)) error {
 	h.mu.Lock()
-	if h.viewerPC != nil {
-		_ = h.viewerPC.Close()
-	}
-	h.viewerPC = pc
-	h.viewerSend = send
-	track := h.localTrack
+	h.controlGen++
+	gen := h.controlGen
+	h.controlSend = send
+	hasActive := h.activeLocalLocked() != nil
 	h.mu.Unlock()
 
 	defer func() {
 		h.mu.Lock()
-		if h.viewerPC == pc {
-			h.viewerPC = nil
-			h.viewerSend = nil
+		if h.controlGen == gen {
+			h.controlSend = nil
+			if h.controlPC != nil {
+				_ = h.controlPC.Close()
+				h.controlPC = nil
+			}
 		}
 		h.mu.Unlock()
-		_ = pc.Close()
 	}()
+
+	send(signalMsg{Type: "devices", Devices: h.snapshotDevices()})
+	if hasActive {
+		send(signalMsg{Type: "status", Message: "track-ready"})
+	} else {
+		send(signalMsg{Type: "status", Message: "waiting-for-phone"})
+	}
+
+	for {
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			return err
+		}
+		var msg signalMsg
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+		if err := h.handleControlSignal(msg, send); err != nil {
+			return err
+		}
+	}
+}
+
+func (h *Hub) handleControlSignal(msg signalMsg, send func(signalMsg)) error {
+	switch msg.Type {
+	case "select":
+		if msg.ID == "" {
+			return nil
+		}
+		if err := h.setActive(msg.ID); err != nil {
+			send(signalMsg{Type: "error", Message: err.Error()})
+		}
+		return nil
+
+	case "offer":
+		h.mu.Lock()
+		track := h.activeLocalLocked()
+		h.mu.Unlock()
+		if track == nil {
+			send(signalMsg{Type: "status", Message: "waiting-for-phone"})
+			return nil
+		}
+
+		pc, err := h.newControlPC(send)
+		if err != nil {
+			return err
+		}
+		if err := h.attachTrack(pc, track); err != nil {
+			_ = pc.Close()
+			return err
+		}
+		if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+			Type: webrtc.SDPTypeOffer,
+			SDP:  msg.SDP,
+		}); err != nil {
+			_ = pc.Close()
+			return fmt.Errorf("control set remote offer: %w", err)
+		}
+		answer, err := pc.CreateAnswer(nil)
+		if err != nil {
+			_ = pc.Close()
+			return fmt.Errorf("control create answer: %w", err)
+		}
+		if err := pc.SetLocalDescription(answer); err != nil {
+			_ = pc.Close()
+			return fmt.Errorf("control set local answer: %w", err)
+		}
+		send(signalMsg{Type: "answer", SDP: answer.SDP})
+
+	case "candidate":
+		if msg.Candidate == "" {
+			return nil
+		}
+		h.mu.Lock()
+		pc := h.controlPC
+		h.mu.Unlock()
+		if pc == nil {
+			return nil
+		}
+		cand := webrtc.ICECandidateInit{Candidate: msg.Candidate}
+		if msg.SDPMid != "" {
+			cand.SDPMid = &msg.SDPMid
+		}
+		if msg.SDPMLineIx != nil {
+			idx := uint16(*msg.SDPMLineIx)
+			cand.SDPMLineIndex = &idx
+		}
+		if err := pc.AddICECandidate(cand); err != nil {
+			log.Printf("control add candidate: %v", err)
+		}
+	}
+	return nil
+}
+
+func (h *Hub) newControlPC(send func(signalMsg)) (*webrtc.PeerConnection, error) {
+	pc, err := h.api.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		return nil, err
+	}
+
+	h.mu.Lock()
+	old := h.controlPC
+	h.controlPC = pc
+	h.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -345,33 +489,10 @@ func (h *Hub) serveViewer(ctx context.Context, conn *websocket.Conn, send func(s
 		}
 		send(msg)
 	})
-
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		log.Printf("viewer peer state: %s", s)
+		log.Printf("control peer state: %s", s)
 	})
-
-	if track != nil {
-		if err := h.attachTrack(pc, track); err != nil {
-			return err
-		}
-		send(signalMsg{Type: "status", Message: "track-ready"})
-	} else {
-		send(signalMsg{Type: "status", Message: "waiting-for-phone"})
-	}
-
-	for {
-		_, data, err := conn.Read(ctx)
-		if err != nil {
-			return err
-		}
-		var msg signalMsg
-		if err := json.Unmarshal(data, &msg); err != nil {
-			continue
-		}
-		if err := h.handleViewerSignal(pc, msg, send); err != nil {
-			return err
-		}
-	}
+	return pc, nil
 }
 
 func (h *Hub) attachTrack(pc *webrtc.PeerConnection, track *webrtc.TrackLocalStaticRTP) error {
@@ -390,56 +511,177 @@ func (h *Hub) attachTrack(pc *webrtc.PeerConnection, track *webrtc.TrackLocalSta
 	return nil
 }
 
-func (h *Hub) handleViewerSignal(pc *webrtc.PeerConnection, msg signalMsg, send func(signalMsg)) error {
-	switch msg.Type {
-	case "offer":
-		h.mu.Lock()
-		track := h.localTrack
+func (h *Hub) setActive(id string) error {
+	h.mu.Lock()
+	d, ok := h.devices[id]
+	if !ok || d.State != "live" || d.Local == nil {
 		h.mu.Unlock()
+		return fmt.Errorf("device %s not available", id)
+	}
+	if h.activeID == id {
+		h.mu.Unlock()
+		h.broadcastDevices()
+		return nil
+	}
+	h.activeID = id
+	h.mu.Unlock()
 
-		if track == nil {
-			send(signalMsg{Type: "status", Message: "waiting-for-phone"})
-			return nil
-		}
+	log.Printf("active → %s (%s)", id, d.Name)
+	h.restartVCamForActive()
+	h.broadcastDevices()
+	h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
 
-		// Attach track if this PC does not have a sender yet.
-		if len(pc.GetSenders()) == 0 {
-			if err := h.attachTrack(pc, track); err != nil {
-				return err
-			}
-		}
-
-		if err := pc.SetRemoteDescription(webrtc.SessionDescription{
-			Type: webrtc.SDPTypeOffer,
-			SDP:  msg.SDP,
-		}); err != nil {
-			return fmt.Errorf("viewer set remote offer: %w", err)
-		}
-		answer, err := pc.CreateAnswer(nil)
-		if err != nil {
-			return fmt.Errorf("viewer create answer: %w", err)
-		}
-		if err := pc.SetLocalDescription(answer); err != nil {
-			return fmt.Errorf("viewer set local answer: %w", err)
-		}
-		send(signalMsg{Type: "answer", SDP: answer.SDP})
-	case "candidate":
-		if msg.Candidate == "" {
-			return nil
-		}
-		cand := webrtc.ICECandidateInit{Candidate: msg.Candidate}
-		if msg.SDPMid != "" {
-			cand.SDPMid = &msg.SDPMid
-		}
-		if msg.SDPMLineIx != nil {
-			idx := uint16(*msg.SDPMLineIx)
-			cand.SDPMLineIndex = &idx
-		}
-		if err := pc.AddICECandidate(cand); err != nil {
-			log.Printf("viewer add candidate: %v", err)
-		}
+	h.mu.Lock()
+	remote := d.Remote
+	pc := d.PC
+	h.mu.Unlock()
+	if remote != nil && pc != nil {
+		_ = pc.WriteRTCP([]rtcp.Packet{
+			&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())},
+		})
 	}
 	return nil
+}
+
+func (h *Hub) removeDevice(id string) {
+	h.mu.Lock()
+	d, ok := h.devices[id]
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	delete(h.devices, id)
+	wasActive := h.activeID == id
+	var next string
+	if wasActive {
+		h.activeID = ""
+		h.stopVCamLocked()
+		for _, other := range h.devices {
+			if other.State == "live" && other.Local != nil {
+				next = other.ID
+				break
+			}
+		}
+		h.activeID = next
+	}
+	name := d.Name
+	h.mu.Unlock()
+
+	log.Printf("device - %s (%s)", id, name)
+	if wasActive {
+		if next != "" {
+			log.Printf("active failover → %s", next)
+			h.restartVCamForActive()
+			h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
+		} else {
+			h.notifyControl(signalMsg{Type: "status", Message: "waiting-for-phone"})
+		}
+	}
+	h.broadcastDevices()
+}
+
+func (h *Hub) restartVCamForActive() {
+	h.mu.Lock()
+	h.stopVCamLocked()
+	id := h.activeID
+	devPath := h.v4l2Device
+	var mime string
+	if id != "" {
+		if d := h.devices[id]; d != nil {
+			mime = d.Mime
+		}
+	}
+	h.mu.Unlock()
+
+	if id == "" || devPath == "" {
+		return
+	}
+	if !strings.Contains(strings.ToLower(mime), "h264") {
+		log.Printf("vcam: skip — active %s codec %s (need H264)", id, mime)
+		return
+	}
+
+	cam, err := startVCam(devPath)
+	if err != nil {
+		log.Printf("vcam: %v", err)
+		return
+	}
+
+	h.mu.Lock()
+	if h.activeID != id {
+		h.mu.Unlock()
+		cam.Close()
+		return
+	}
+	h.vcam = cam
+	h.mu.Unlock()
+}
+
+func (h *Hub) stopVCamLocked() {
+	if h.vcam != nil {
+		h.vcam.Close()
+		h.vcam = nil
+	}
+}
+
+func (h *Hub) writeVCam(deviceID string, nal []byte) {
+	h.mu.Lock()
+	if h.activeID != deviceID || h.vcam == nil {
+		h.mu.Unlock()
+		return
+	}
+	cam := h.vcam
+	h.mu.Unlock()
+
+	if err := cam.Write(nal); err != nil {
+		log.Printf("vcam write: %v", err)
+		h.mu.Lock()
+		if h.vcam == cam {
+			h.stopVCamLocked()
+		}
+		h.mu.Unlock()
+	}
+}
+
+func (h *Hub) activeLocalLocked() *webrtc.TrackLocalStaticRTP {
+	if h.activeID == "" {
+		return nil
+	}
+	d := h.devices[h.activeID]
+	if d == nil {
+		return nil
+	}
+	return d.Local
+}
+
+func (h *Hub) snapshotDevices() []deviceInfo {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]deviceInfo, 0, len(h.devices))
+	for _, d := range h.devices {
+		out = append(out, deviceInfo{
+			ID:         d.ID,
+			Name:       d.Name,
+			Capability: d.Capability,
+			State:      d.State,
+			Active:     d.ID == h.activeID,
+		})
+	}
+	return out
+}
+
+func (h *Hub) broadcastDevices() {
+	msg := signalMsg{Type: "devices", Devices: h.snapshotDevices()}
+	h.notifyControl(msg)
+}
+
+func (h *Hub) notifyControl(msg signalMsg) {
+	h.mu.Lock()
+	send := h.controlSend
+	h.mu.Unlock()
+	if send != nil {
+		send(msg)
+	}
 }
 
 func pliLoop(ctx context.Context, pc *webrtc.PeerConnection, track *webrtc.TrackRemote) {
@@ -456,5 +698,30 @@ func pliLoop(ctx context.Context, pc *webrtc.PeerConnection, track *webrtc.Track
 				return
 			}
 		}
+	}
+}
+
+func newDeviceID() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func phoneName(r *http.Request) string {
+	if n := strings.TrimSpace(r.URL.Query().Get("name")); n != "" {
+		return n
+	}
+	ua := r.UserAgent()
+	switch {
+	case strings.Contains(ua, "iPhone"):
+		return "iPhone"
+	case strings.Contains(ua, "iPad"):
+		return "iPad"
+	case strings.Contains(ua, "Android"):
+		return "Android"
+	default:
+		return "Phone"
 	}
 }

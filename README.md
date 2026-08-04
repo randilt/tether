@@ -1,6 +1,7 @@
 # Tether
 
 Phone browser → WebRTC → Linux PC virtual webcam (`v4l2loopback`) + browser preview.
+Multiple phones can connect; the control page picks which one is active.
 
 ## Requirements
 
@@ -61,18 +62,19 @@ Listens on `https://0.0.0.0:8443` (`-addr` to change). First start writes a self
 
 If your LAN IP changes, `rm -rf certs`, restart, reinstall the CA.
 
-## Acceptance check (milestone 2)
+## Acceptance check (milestone 3)
 
-1. `modprobe` the loopback device (above).
-2. `go run .` — confirm it prints `Virtual cam: /dev/video10` without a missing-device warning.
-3. Phone: `/phone` → start camera.
-4. PC: `/control` still shows the preview; logs should show `vcam: ffmpeg → /dev/video10`.
-5. OBS/Zoom → select camera **Tether** (or `/dev/video10`) — live feed with hand-wave latency, not a visible ~500ms lag.
+1. Load v4l2loopback, start `go run .`.
+2. Open `/control` on the PC.
+3. Connect two phones to `/phone` (optionally `?name=Kitchen` / `?name=Desk`).
+4. Both appear in the device list; first live phone becomes active (feeds `/dev/video10` + preview).
+5. Click the other device — preview and virtual cam switch without restarting the server.
+6. Disconnect the active phone — server stays up; another live phone is auto-selected if present.
 
 ## Notes
 
 - LAN-only: no STUN/TURN (`iceServers: []`).
-- Single phone, single virtual cam — no auth, no device picker.
-- Virtual cam path is H264-only (iPhone Safari). Browser preview still relays whatever codec negotiated.
+- No auth, no mic, no packaging in this pass.
+- Virtual cam path is H264-only (iPhone Safari). Browser preview relays the active device’s codec.
 - ffmpeg uses low-latency flags (`nobuffer`, `low_delay`, tiny probesize/analyzeduration).
-- **iPhone → Linux Chrome preview:** Chrome often can’t decode H264 → black `<video>`. Firefox usually works. OBS/Zoom use the v4l2 path and don’t care about the browser codec.
+- **iPhone → Linux Chrome preview:** Chrome often can’t decode H264 → black `<video>`. Firefox usually works. OBS/Zoom use the v4l2 path.

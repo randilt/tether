@@ -2,6 +2,8 @@
   const statusEl = document.getElementById("status");
   const statsEl = document.getElementById("stats");
   const remote = document.getElementById("remote");
+  const listEl = document.getElementById("devices");
+  const emptyEl = document.getElementById("device-empty");
 
   /** @type {RTCPeerConnection | null} */
   let pc = null;
@@ -10,6 +12,8 @@
   let offering = false;
   /** @type {number | null} */
   let statsTimer = null;
+  /** @type {Array<{id:string,name:string,capability:string,state:string,active:boolean}>} */
+  let devices = [];
 
   function setStatus(text, state = "wait") {
     statusEl.textContent = text;
@@ -18,13 +22,46 @@
 
   function wsURL() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${proto}//${location.host}/ws?role=viewer`;
+    return `${proto}//${location.host}/ws?role=control`;
   }
 
   function send(msg) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
+  }
+
+  function renderDevices() {
+    listEl.innerHTML = "";
+    emptyEl.hidden = devices.length > 0;
+    for (const d of devices) {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "device" + (d.active ? " active" : "");
+      btn.disabled = d.state !== "live";
+      btn.innerHTML =
+        `<span class="device-name">${escapeHtml(d.name)}</span>` +
+        `<span class="device-meta">${escapeHtml(d.capability)} · ${escapeHtml(d.state)}` +
+        (d.active ? " · active" : "") +
+        `</span>` +
+        `<span class="device-id">${escapeHtml(d.id)}</span>`;
+      btn.addEventListener("click", () => {
+        if (d.active) return;
+        send({ type: "select", id: d.id });
+        setStatus(`Switching to ${d.name}…`, "wait");
+      });
+      li.appendChild(btn);
+      listEl.appendChild(li);
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
 
   function stopStats() {
@@ -58,9 +95,6 @@
       const w = remote.videoWidth || 0;
       const h = remote.videoHeight || 0;
       statsEl.textContent = `${mime} · ${w}x${h} · frames=${frames} · bytes=${bytes}`;
-
-      // Only warn when RTP flows but the <video> never gets a picture.
-      // (framesDecoded is missing/0 in some Chromium builds even when decode works.)
       if (ticks >= 3 && bytes > 1000 && w === 0 && h === 0 && frames === 0) {
         setStatus(
           "Receiving RTP but no picture — Linux Chrome often lacks H264. Try Firefox for /control.",
@@ -87,7 +121,8 @@
       remote.srcObject = stream;
       remote.muted = true;
       remote.play().catch(() => {});
-      setStatus("Live — phone camera", "live");
+      const active = devices.find((d) => d.active);
+      setStatus(active ? `Live — ${active.name}` : "Live — phone camera", "live");
       startStats();
     };
 
@@ -133,13 +168,25 @@
       return;
     }
 
+    if (msg.type === "devices") {
+      devices = Array.isArray(msg.devices) ? msg.devices : [];
+      renderDevices();
+      return;
+    }
+
     if (msg.type === "status") {
       if (msg.message === "waiting-for-phone") {
+        stopStats();
+        if (pc) {
+          pc.close();
+          pc = null;
+        }
+        remote.srcObject = null;
         setStatus("Waiting for phone to start…", "wait");
         return;
       }
       if (msg.message === "track-ready") {
-        setStatus("Phone track ready — connecting…", "wait");
+        setStatus("Active track ready — connecting…", "wait");
         createPC();
         await sendOffer();
         return;

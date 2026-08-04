@@ -9,14 +9,21 @@
 <body>
   <header>
     <h1>Tether · Control</h1>
-    <p>Live preview of the phone camera. No virtual webcam yet.</p>
+    <p>Pick which phone feeds the virtual camera. Preview shows the active device.</p>
   </header>
-  <main>
-    <div class="stage">
-      <video id="remote" playsinline autoplay muted></video>
-    </div>
-    <p id="status" class="status" data-state="wait">Connecting…</p>
-    <p id="stats" class="status"> </p>
+  <main class="control-main">
+    <aside class="device-panel">
+      <h2>Devices</h2>
+      <ul id="devices" class="device-list"></ul>
+      <p id="device-empty" class="status" data-state="wait">No phones connected</p>
+    </aside>
+    <section class="preview-panel">
+      <div class="stage">
+        <video id="remote" playsinline autoplay muted></video>
+      </div>
+      <p id="status" class="status" data-state="wait">Connecting…</p>
+      <p id="stats" class="status"> </p>
+    </section>
   </main>
   <script src="/control.js"></script>
 </body>

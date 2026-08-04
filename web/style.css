@@ -55,6 +55,85 @@ main {
   padding: 0.75rem 1.5rem 1.25rem;
 }
 
+.control-main {
+  flex-direction: row;
+  align-items: stretch;
+}
+
+.device-panel {
+  flex: 0 0 16rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 0;
+}
+
+.device-panel h2 {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.device-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-height: 0;
+}
+
+.device {
+  width: 100%;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--line);
+  background: #12171c;
+}
+
+.device:hover:not(:disabled) {
+  border-color: #2a3540;
+}
+
+.device.active {
+  border-color: var(--accent);
+  background: #102018;
+}
+
+.device-name {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.device-meta {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.device-id {
+  font-size: 0.7rem;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  color: #5c6a75;
+}
+
+.preview-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
 .stage {
   position: relative;
   flex: 1;
@@ -112,4 +191,14 @@ button.primary {
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
+}
+
+@media (max-width: 720px) {
+  .control-main {
+    flex-direction: column;
+  }
+  .device-panel {
+    flex: 0 0 auto;
+    max-height: 30%;
+  }
 }
