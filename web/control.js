@@ -6,7 +6,12 @@
   const emptyEl = document.getElementById("device-empty");
   const pairCodeEl = document.getElementById("pair-code");
   const pairURLEl = document.getElementById("pair-url");
+  const pairHintEl = document.getElementById("pair-hint");
   const copyBtn = document.getElementById("copy-url");
+  const v4l2Banner = document.getElementById("v4l2-banner");
+  const v4l2Msg = document.getElementById("v4l2-msg");
+  const v4l2Cmd = document.getElementById("v4l2-cmd");
+  const v4l2Copy = document.getElementById("v4l2-copy");
 
   /** @type {RTCPeerConnection | null} */
   let pc = null;
@@ -15,12 +20,63 @@
   let offering = false;
   /** @type {number | null} */
   let statsTimer = null;
+  /** @type {number | null} */
+  let pairTimer = null;
   /** @type {Array<{id:string,name:string,capability:string,state:string,active:boolean}>} */
   let devices = [];
   let pairURL = "";
+  let v4l2Command = "";
+  let pairExpiresAt = 0;
+
   function setStatus(text, state = "wait") {
     statusEl.textContent = text;
     statusEl.dataset.state = state;
+  }
+
+  function updatePairHint() {
+    if (!pairExpiresAt) {
+      pairHintEl.textContent = "Code expires in 10 minutes or after the first phone connects.";
+      return;
+    }
+    const sec = Math.max(0, Math.floor(pairExpiresAt - Date.now() / 1000));
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    pairHintEl.textContent =
+      `Expires in ${m}:${String(s).padStart(2, "0")} or after first phone connects. New codes appear here automatically.`;
+  }
+
+  function renderPair(msg) {
+    if (msg.code) {
+      pairCodeEl.textContent = msg.code;
+      pairCodeEl.classList.remove("pair-flash");
+      void pairCodeEl.offsetWidth;
+      pairCodeEl.classList.add("pair-flash");
+    }
+    if (msg.url) {
+      pairURL = msg.url;
+      pairURLEl.textContent = msg.url;
+    }
+    if (msg.expiresAt) {
+      pairExpiresAt = msg.expiresAt;
+      updatePairHint();
+      if (pairTimer != null) clearInterval(pairTimer);
+      pairTimer = setInterval(updatePairHint, 1000);
+    }
+  }
+
+  function renderV4L2(msg) {
+    const available = msg.available !== false;
+    if (available || !msg.device) {
+      v4l2Banner.hidden = true;
+      v4l2Command = "";
+      return;
+    }
+    v4l2Banner.hidden = false;
+    v4l2Msg.textContent = msg.message || `Virtual camera not available — ${msg.device} is missing`;
+    v4l2Command = msg.command || "";
+    v4l2Cmd.textContent = v4l2Command;
+    v4l2Cmd.hidden = !v4l2Command;
+    v4l2Copy.hidden = !v4l2Command;
   }
 
   function wsURL() {
@@ -172,11 +228,12 @@
     }
 
     if (msg.type === "pair") {
-      if (msg.code) pairCodeEl.textContent = msg.code;
-      if (msg.url) {
-        pairURL = msg.url;
-        pairURLEl.textContent = msg.url;
-      }
+      renderPair(msg);
+      return;
+    }
+
+    if (msg.type === "v4l2") {
+      renderV4L2(msg);
       return;
     }
 
@@ -271,6 +328,17 @@
       setTimeout(() => { copyBtn.textContent = "Copy phone URL"; }, 1500);
     } catch {
       copyBtn.textContent = "Copy failed";
+    }
+  });
+
+  v4l2Copy.addEventListener("click", async () => {
+    if (!v4l2Command) return;
+    try {
+      await navigator.clipboard.writeText(v4l2Command);
+      v4l2Copy.textContent = "Copied";
+      setTimeout(() => { v4l2Copy.textContent = "Copy command"; }, 1500);
+    } catch {
+      v4l2Copy.textContent = "Copy failed";
     }
   });
 

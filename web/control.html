@@ -7,9 +7,16 @@
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
+  <div id="v4l2-banner" class="v4l2-banner" hidden>
+    <div class="v4l2-banner-body">
+      <p id="v4l2-msg" class="v4l2-msg"></p>
+      <code id="v4l2-cmd" class="v4l2-cmd"></code>
+    </div>
+    <button id="v4l2-copy" type="button">Copy command</button>
+  </div>
   <header>
     <h1>Tether · Control</h1>
-    <p>Pick which phone feeds the virtual camera. Preview shows the active device.</p>
+    <p>Pick which phone feeds the virtual camera. Preview shows the active device. Localhost only.</p>
   </header>
   <main class="control-main">
     <aside class="device-panel">
@@ -20,7 +27,7 @@
         <div class="actions">
           <button id="copy-url" type="button">Copy phone URL</button>
         </div>
-        <p class="pair-hint">Phones open this URL (or enter the code on /phone). New code each server restart.</p>
+        <p class="pair-hint" id="pair-hint">Code expires in 10 minutes or after the first phone connects. Control updates automatically.</p>
       </section>
       <h2>Devices</h2>
       <ul id="devices" class="device-list"></ul>

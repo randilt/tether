@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,10 @@ type signalMsg struct {
 	Devices    []deviceInfo `json:"devices,omitempty"`
 	Code       string       `json:"code,omitempty"`
 	URL        string       `json:"url,omitempty"`
+	Available  *bool        `json:"available,omitempty"`
+	Command    string       `json:"command,omitempty"`
+	Device     string       `json:"device,omitempty"`
+	ExpiresAt  int64        `json:"expiresAt,omitempty"`
 }
 
 type deviceInfo struct {
@@ -78,22 +83,26 @@ func (d *device) capability() string {
 }
 
 type Hub struct {
-	api         *webrtc.API
-	v4l2Device  string
-	audioDest   string
-	pairCode    string
+	api          *webrtc.API
+	v4l2Device   string
+	audioDest    string
+	phoneBaseURL string
 
 	mu          sync.Mutex
 	devices     map[string]*device
 	activeID    string
 	vcam        *vcam
 	asink       *asink
+	v4l2OK      bool
+	v4l2Msg     string
+	pairCode    string
+	pairExpires time.Time
 	controlPC   *webrtc.PeerConnection
 	controlSend func(signalMsg)
 	controlGen  int
 }
 
-func newHub(v4l2Device, audioDest, pairCode string) (*Hub, error) {
+func newHub(v4l2Device, audioDest string) (*Hub, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, err
@@ -129,27 +138,147 @@ func newHub(v4l2Device, audioDest, pairCode string) (*Hub, error) {
 		webrtc.WithSettingEngine(se),
 	)
 
-	return &Hub{
+	h := &Hub{
 		api:        api,
 		v4l2Device: v4l2Device,
 		audioDest:  audioDest,
-		pairCode:   pairCode,
 		devices:    make(map[string]*device),
-	}, nil
+	}
+	h.refreshV4L2Status()
+	h.mu.Lock()
+	err := h.rotatePairLocked("startup")
+	h.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	go h.pairExpiryLoop()
+	return h, nil
 }
 
-func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
-	rRole := role(r.URL.Query().Get("role"))
-	if rRole != rolePhone && rRole != roleControl && rRole != roleViewer {
-		http.Error(w, "role must be phone or control", http.StatusBadRequest)
+func (h *Hub) setPhoneBaseURL(base string) {
+	h.mu.Lock()
+	h.phoneBaseURL = strings.TrimRight(base, "/")
+	h.mu.Unlock()
+}
+
+func (h *Hub) pairSnapshot() (code, url string, expires time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.pairCode, phonePairURL(h.phoneBaseURL, h.pairCode), h.pairExpires
+}
+
+// rotatePairLocked issues a new code. Caller must hold h.mu.
+func (h *Hub) rotatePairLocked(reason string) error {
+	code, err := generatePairCode()
+	if err != nil {
+		return err
+	}
+	h.pairCode = code
+	h.pairExpires = time.Now().Add(pairCodeTTL)
+	log.Printf("pairing code rotated (%s): %s (valid %s)", reason, code, pairCodeTTL)
+	return nil
+}
+
+func (h *Hub) rotatePair(reason string) {
+	h.mu.Lock()
+	err := h.rotatePairLocked(reason)
+	msg := h.pairStatusMsgLocked()
+	h.mu.Unlock()
+	if err != nil {
+		log.Printf("pairing rotate: %v", err)
 		return
 	}
+	h.notifyControl(msg)
+}
+
+func (h *Hub) pairStatusMsgLocked() signalMsg {
+	return signalMsg{
+		Type:      "pair",
+		Code:      h.pairCode,
+		URL:       phonePairURL(h.phoneBaseURL, h.pairCode),
+		ExpiresAt: h.pairExpires.Unix(),
+		Message:   fmt.Sprintf("valid for %s or until first phone connects", pairCodeTTL),
+	}
+}
+
+func (h *Hub) pairExpiryLoop() {
+	t := time.NewTicker(pairExpiryTick)
+	defer t.Stop()
+	for range t.C {
+		h.mu.Lock()
+		expired := !h.pairExpires.IsZero() && time.Now().After(h.pairExpires)
+		var msg signalMsg
+		if expired {
+			if err := h.rotatePairLocked("expired"); err != nil {
+				h.mu.Unlock()
+				log.Printf("pairing expiry rotate: %v", err)
+				continue
+			}
+			msg = h.pairStatusMsgLocked()
+		}
+		h.mu.Unlock()
+		if expired {
+			h.notifyControl(msg)
+		}
+	}
+}
+
+// tryConsumePairToken validates the phone token and invalidates it on success
+// (single-use). A fresh code is issued for the next pair.
+func (h *Hub) tryConsumePairToken(r *http.Request) bool {
+	t := r.URL.Query().Get("t")
+	if t == "" {
+		t = r.URL.Query().Get("token")
+	}
+	got := normalizePairCode(t)
+
+	h.mu.Lock()
+	if got == "" || got != normalizePairCode(h.pairCode) {
+		h.mu.Unlock()
+		return false
+	}
+	if time.Now().After(h.pairExpires) {
+		_ = h.rotatePairLocked("expired-on-use")
+		msg := h.pairStatusMsgLocked()
+		h.mu.Unlock()
+		h.notifyControl(msg)
+		return false
+	}
+	if err := h.rotatePairLocked("used"); err != nil {
+		h.mu.Unlock()
+		log.Printf("pairing consume rotate: %v", err)
+		return false
+	}
+	msg := h.pairStatusMsgLocked()
+	h.mu.Unlock()
+	h.notifyControl(msg)
+	return true
+}
+
+func (h *Hub) handlePhoneWS(w http.ResponseWriter, r *http.Request) {
+	h.handleWS(w, r, rolePhone)
+}
+
+func (h *Hub) handleControlWS(w http.ResponseWriter, r *http.Request) {
+	h.handleWS(w, r, roleControl)
+}
+
+func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request, allowed role) {
+	rRole := role(r.URL.Query().Get("role"))
 	if rRole == roleViewer {
 		rRole = roleControl
 	}
+	if rRole != allowed {
+		http.Error(w, "role not allowed on this listener", http.StatusForbidden)
+		return
+	}
+	if rRole != rolePhone && rRole != roleControl {
+		http.Error(w, "role must be phone or control", http.StatusBadRequest)
+		return
+	}
 
-	if rRole == rolePhone && !h.validPairToken(r) {
-		http.Error(w, "pairing code required", http.StatusForbidden)
+	if rRole == rolePhone && !h.tryConsumePairToken(r) {
+		http.Error(w, "pairing code required or expired", http.StatusForbidden)
 		return
 	}
 
@@ -185,19 +314,11 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 			send(signalMsg{Type: "error", Message: err.Error()})
 		}
 	case roleControl:
-		if err := h.serveControl(ctx, r, conn, send); err != nil && !errors.Is(err, context.Canceled) {
+		if err := h.serveControl(ctx, conn, send); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("control session: %v", err)
 			send(signalMsg{Type: "error", Message: err.Error()})
 		}
 	}
-}
-
-func (h *Hub) validPairToken(r *http.Request) bool {
-	t := r.URL.Query().Get("t")
-	if t == "" {
-		t = r.URL.Query().Get("token")
-	}
-	return normalizePairCode(t) == normalizePairCode(h.pairCode)
 }
 
 func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.Conn, send func(signalMsg)) error {
@@ -449,13 +570,19 @@ func (h *Hub) handlePhoneSignal(pc *webrtc.PeerConnection, msg signalMsg, send f
 	return nil
 }
 
-func (h *Hub) serveControl(ctx context.Context, r *http.Request, conn *websocket.Conn, send func(signalMsg)) error {
+func (h *Hub) serveControl(ctx context.Context, conn *websocket.Conn, send func(signalMsg)) error {
 	h.mu.Lock()
 	h.controlGen++
 	gen := h.controlGen
 	h.controlSend = send
 	hasActive := h.activeLocalLocked() != nil
-	code := h.pairCode
+	hasAudioOnly := false
+	if h.activeID != "" {
+		if d := h.devices[h.activeID]; d != nil && d.HasAudio && !d.HasVideo {
+			hasAudioOnly = true
+		}
+	}
+	pairMsg := h.pairStatusMsgLocked()
 	h.mu.Unlock()
 
 	defer func() {
@@ -470,15 +597,15 @@ func (h *Hub) serveControl(ctx context.Context, r *http.Request, conn *websocket
 		h.mu.Unlock()
 	}()
 
-	send(signalMsg{
-		Type: "pair",
-		Code: code,
-		URL:  phonePairURL(r.Host, code),
-	})
+	send(pairMsg)
+	send(h.v4l2StatusMsg())
 	send(signalMsg{Type: "devices", Devices: h.snapshotDevices()})
-	if hasActive {
+	switch {
+	case hasActive:
 		send(signalMsg{Type: "status", Message: "track-ready"})
-	} else {
+	case hasAudioOnly:
+		send(signalMsg{Type: "status", Message: "audio-only"})
+	default:
 		send(signalMsg{Type: "status", Message: "waiting-for-phone"})
 	}
 
@@ -713,7 +840,13 @@ func (h *Hub) restartVCamForActive() {
 	}
 	h.mu.Unlock()
 
+	h.refreshV4L2Status()
+	h.notifyControl(h.v4l2StatusMsg())
+
 	if id == "" || devPath == "" || mime == "" {
+		return
+	}
+	if !h.v4l2DeviceAvailable() {
 		return
 	}
 	if !strings.Contains(strings.ToLower(mime), "h264") {
@@ -724,6 +857,8 @@ func (h *Hub) restartVCamForActive() {
 	cam, err := startVCam(devPath)
 	if err != nil {
 		log.Printf("vcam: %v", err)
+		h.setV4L2Error(fmt.Sprintf("Virtual camera failed — %v", err))
+		h.notifyControl(h.v4l2StatusMsg())
 		return
 	}
 
@@ -734,7 +869,59 @@ func (h *Hub) restartVCamForActive() {
 		return
 	}
 	h.vcam = cam
+	h.v4l2OK = true
+	h.v4l2Msg = ""
 	h.mu.Unlock()
+	h.notifyControl(h.v4l2StatusMsg())
+}
+
+func (h *Hub) refreshV4L2Status() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.v4l2Device == "" {
+		h.v4l2OK = true
+		h.v4l2Msg = ""
+		return
+	}
+	if _, err := os.Stat(h.v4l2Device); err != nil {
+		h.v4l2OK = false
+		h.v4l2Msg = fmt.Sprintf("Virtual camera not available — %s is missing", h.v4l2Device)
+		return
+	}
+	h.v4l2OK = true
+	h.v4l2Msg = ""
+}
+
+func (h *Hub) setV4L2Error(msg string) {
+	h.mu.Lock()
+	h.v4l2OK = false
+	h.v4l2Msg = msg
+	h.mu.Unlock()
+}
+
+func (h *Hub) v4l2DeviceAvailable() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.v4l2Device == "" || h.v4l2OK
+}
+
+func (h *Hub) v4l2StatusMsg() signalMsg {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ok := h.v4l2OK
+	msg := signalMsg{
+		Type:      "v4l2",
+		Available: &ok,
+		Device:    h.v4l2Device,
+		Message:   h.v4l2Msg,
+	}
+	if h.v4l2Device != "" && !h.v4l2OK {
+		msg.Command = v4l2FixCommand(h.v4l2Device)
+		if msg.Message == "" {
+			msg.Message = fmt.Sprintf("Virtual camera not available — %s is missing", h.v4l2Device)
+		}
+	}
+	return msg
 }
 
 func (h *Hub) restartAudioForActive() {

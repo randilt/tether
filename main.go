@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/mdp/qrterminal/v3"
 )
@@ -18,7 +19,8 @@ import (
 var webFS embed.FS
 
 func main() {
-	addr := flag.String("addr", ":8443", "HTTPS listen address")
+	addr := flag.String("addr", ":8443", "LAN HTTPS listen address (phone + cert)")
+	controlAddr := flag.String("control", "127.0.0.1:8444", "localhost HTTPS listen for PC control UI")
 	v4l2 := flag.String("v4l2", "/dev/video10", "v4l2loopback device (empty disables virtual cam)")
 	audio := flag.String("audio", "pulse:default", "audio sink: pulse:default | alsa:default | alsa:hw:Loopback,0,0 | empty disables")
 	flag.Parse()
@@ -28,12 +30,7 @@ func main() {
 		log.Fatalf("cert: %v", err)
 	}
 
-	pairCode, err := generatePairCode()
-	if err != nil {
-		log.Fatalf("pair code: %v", err)
-	}
-
-	hub, err := newHub(*v4l2, *audio, pairCode)
+	hub, err := newHub(*v4l2, *audio)
 	if err != nil {
 		log.Fatalf("webrtc: %v", err)
 	}
@@ -43,12 +40,25 @@ func main() {
 		log.Fatalf("embed: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", hub.handleWS)
-	mux.HandleFunc("/cert.cer", serveCertDER)
-	mux.HandleFunc("/phone", serveFile(webContent, "phone.html"))
-	mux.HandleFunc("/control", serveFile(webContent, "control.html"))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	phoneBase := phonePublicBase(*addr)
+	hub.setPhoneBaseURL(phoneBase)
+
+	phoneMux := http.NewServeMux()
+	phoneMux.HandleFunc("/ws", hub.handlePhoneWS)
+	phoneMux.HandleFunc("/cert.cer", serveCertDER)
+	phoneMux.HandleFunc("/phone", serveFile(webContent, "phone.html"))
+	phoneMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.FileServer(http.FS(webContent)).ServeHTTP(w, r)
+			return
+		}
+		http.Redirect(w, r, "/phone", http.StatusFound)
+	})
+
+	controlMux := http.NewServeMux()
+	controlMux.HandleFunc("/ws", hub.handleControlWS)
+	controlMux.HandleFunc("/control", serveFile(webContent, "control.html"))
+	controlMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.FileServer(http.FS(webContent)).ServeHTTP(w, r)
 			return
@@ -56,11 +66,37 @@ func main() {
 		http.Redirect(w, r, "/control", http.StatusFound)
 	})
 
-	printURLs(*addr, *v4l2, *audio, pairCode)
-	log.Printf("listening on https://%s", *addr)
-	if err := http.ListenAndServeTLS(*addr, certPath, keyPath, mux); err != nil {
-		log.Fatal(err)
+	code, phoneURL, _ := hub.pairSnapshot()
+	printURLs(*addr, *controlAddr, *v4l2, *audio, code, phoneBase, phoneURL)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		log.Printf("phone (LAN) listening on https://%s", *addr)
+		if err := http.ListenAndServeTLS(*addr, certPath, keyPath, phoneMux); err != nil {
+			log.Fatalf("phone listener: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		log.Printf("control (localhost) listening on https://%s", *controlAddr)
+		if err := http.ListenAndServeTLS(*controlAddr, certPath, keyPath, controlMux); err != nil {
+			log.Fatalf("control listener: %v", err)
+		}
+	}()
+	wg.Wait()
+}
+
+func phonePublicBase(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		port = "8443"
 	}
+	if lan := lanIPv4s(); len(lan) > 0 {
+		return fmt.Sprintf("https://%s:%s", lan[0], port)
+	}
+	return fmt.Sprintf("https://localhost:%s", port)
 }
 
 func serveFile(fsys fs.FS, name string) http.HandlerFunc {
@@ -86,34 +122,19 @@ func serveCertDER(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func printURLs(addr, v4l2Device, audioDest, pairCode string) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		port = "8443"
-		host = ""
-	}
-	if host == "" || host == "0.0.0.0" || host == "::" {
-		host = "localhost"
-	}
-
-	lan := lanIPv4s()
-	scanHost := host
-	if len(lan) > 0 {
-		scanHost = lan[0]
-	}
-	phoneURL := fmt.Sprintf("https://%s:%s/phone?t=%s", scanHost, port, pairCode)
-
+func printURLs(phoneAddr, controlAddr, v4l2Device, audioDest, pairCode, phoneBase, phoneURL string) {
 	fmt.Println()
 	fmt.Println("Tether — phone → WebRTC → v4l2 / audio")
 	fmt.Println("──────────────────────────────────────")
-	fmt.Printf("  Pairing code: %s\n", pairCode)
-	fmt.Printf("  PC control:   https://%s:%s/control\n", host, port)
+	fmt.Printf("  Pairing code: %s  (expires in %s or after first use)\n", pairCode, pairCodeTTL)
+	fmt.Printf("  PC control:   https://%s/control  (localhost only)\n", controlAddr)
 	fmt.Printf("  Phone URL:    %s\n", phoneURL)
-	fmt.Printf("  Install cert: https://%s:%s/cert.cer\n", host, port)
+	fmt.Printf("  Install cert: %s/cert.cer\n", phoneBase)
 	if v4l2Device != "" {
 		fmt.Printf("  Virtual cam:  %s\n", v4l2Device)
 		if _, err := os.Stat(v4l2Device); err != nil {
-			fmt.Printf("  WARNING: %s missing — load v4l2loopback (see README)\n", v4l2Device)
+			fmt.Printf("  ERROR: %s missing — control page shows fix command\n", v4l2Device)
+			fmt.Printf("         %s\n", v4l2FixCommand(v4l2Device))
 		}
 	} else {
 		fmt.Println("  Virtual cam:  disabled")
@@ -123,11 +144,17 @@ func printURLs(addr, v4l2Device, audioDest, pairCode string) {
 	} else {
 		fmt.Println("  Audio sink:   disabled")
 	}
-	for _, ip := range lan {
-		if ip == scanHost {
+
+	_, phonePort, _ := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(phoneBase, "https://"), "http://"))
+	if phonePort == "" {
+		phonePort = "8443"
+	}
+	for _, ip := range lanIPv4s() {
+		alt := fmt.Sprintf("https://%s:%s/phone?t=%s", ip, phonePort, pairCode)
+		if alt == phoneURL {
 			continue
 		}
-		fmt.Printf("  Phone (alt):  https://%s:%s/phone?t=%s\n", ip, port, pairCode)
+		fmt.Printf("  Phone (alt):  %s\n", alt)
 	}
 
 	fmt.Println()
@@ -138,7 +165,8 @@ func printURLs(addr, v4l2Device, audioDest, pairCode string) {
 		HalfBlocks: true,
 		QuietZone:  1,
 	})
-	fmt.Println("Phones need this URL/code. New code each restart.")
+	fmt.Println("Codes expire after 10 minutes or first successful pair; control page updates live.")
+	fmt.Println("Open control on this PC only (not from other LAN devices).")
 	fmt.Println("First time on iPhone: open /cert.cer, install + Full Trust (see README).")
 	fmt.Println()
 }
@@ -169,7 +197,7 @@ func lanIPv4s() []string {
 				continue
 			}
 			s := ip.String()
-			if strings.HasPrefix(s, "172.17.") { // docker bridge noise
+			if strings.HasPrefix(s, "172.17.") {
 				continue
 			}
 			out = append(out, s)
