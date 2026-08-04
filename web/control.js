@@ -9,13 +9,6 @@
   const pairURLEl = document.getElementById("pair-url");
   const pairHintEl = document.getElementById("pair-hint");
   const copyBtn = document.getElementById("copy-url");
-  const v4l2Banner = document.getElementById("v4l2-banner");
-  const v4l2Msg = document.getElementById("v4l2-msg");
-  const v4l2Cmd = document.getElementById("v4l2-cmd");
-  const v4l2Copy = document.getElementById("v4l2-copy");
-  const ndiBanner = document.getElementById("ndi-banner");
-  const ndiMsg = document.getElementById("ndi-msg");
-  const ndiLink = document.getElementById("ndi-link");
   const safetyModal = document.getElementById("safety-modal");
   const safetyAck = document.getElementById("safety-ack");
   const codecH264 = document.getElementById("codec-h264");
@@ -23,7 +16,6 @@
   const codecStatus = document.getElementById("codec-status");
 
   const SAFETY_FLAG = "tether_safety_ack_v1";
-  const NDI_WARN_FLAG = "tether_ndi_lan_ack_v1";
   let preferredCodec = "h264";
 
   /** @type {RTCPeerConnection | null} */
@@ -38,7 +30,6 @@
   /** @type {Array<{id:string,name:string,capability:string,state:string,active:boolean}>} */
   let devices = [];
   let pairURL = "";
-  let v4l2Command = "";
   let pairExpiresAt = 0;
 
   function setStatus(text, state = "wait") {
@@ -93,48 +84,13 @@
     }
   }
 
-  function renderV4L2(msg) {
-    const available = msg.available !== false;
-    if (available || !msg.device) {
-      v4l2Banner.hidden = true;
-      v4l2Command = "";
-      return;
-    }
-    v4l2Banner.hidden = false;
-    v4l2Msg.textContent = msg.message || `Virtual camera not available — ${msg.device} is missing`;
-    v4l2Command = msg.command || "";
-    v4l2Cmd.textContent = v4l2Command;
-    v4l2Cmd.hidden = !v4l2Command;
-    v4l2Copy.hidden = !v4l2Command;
-  }
-
-  function renderNDI(msg) {
-    if (!msg.enabled) {
-      ndiBanner.hidden = true;
-      return;
-    }
-    ndiBanner.hidden = false;
-    if (msg.url) ndiLink.href = msg.url;
-    if (msg.available === false) {
-      ndiMsg.textContent = msg.message || "NDI enabled but runtime missing";
-      ndiMsg.dataset.state = "error";
-      return;
-    }
-    ndiMsg.dataset.state = "live";
-    ndiMsg.textContent = msg.message || "NDI on — each live phone publishes a source (see device list). OBS/vMix can switch between them.";
-    try {
-      if (localStorage.getItem(NDI_WARN_FLAG) !== "1") {
-        alert("NDI is enabled: sources are unencrypted and discoverable on this LAN. Prefer -ndi-groups on shared Wi‑Fi. See SAFETY.md.");
-        localStorage.setItem(NDI_WARN_FLAG, "1");
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
   function renderCodec(codec) {
     preferredCodec = codec === "vp8" ? "vp8" : "h264";
     codecStatus.textContent = `Preferred: ${preferredCodec === "vp8" ? "VP8" : "H.264"} (next phone connect/resume)`;
+  }
+
+  function viewURL(id) {
+    return `${location.origin}/view?id=${encodeURIComponent(id)}`;
   }
 
   function wsURL() {
@@ -153,6 +109,8 @@
     emptyEl.hidden = devices.length > 0;
     for (const d of devices) {
       const li = document.createElement("li");
+      li.className = "device-row";
+
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "device" + (d.active ? " active" : "");
@@ -160,16 +118,47 @@
       btn.innerHTML =
         `<span class="device-name">${escapeHtml(d.name)}</span>` +
         `<span class="device-meta">${escapeHtml(d.capability)} · ${escapeHtml(d.state)}` +
-        (d.active ? " · active" : "") +
-        (d.ndi ? ` · NDI: ${escapeHtml(d.ndi)}` : "") +
+        (d.active ? " · preview" : "") +
         `</span>` +
         `<span class="device-id">${escapeHtml(d.id)}</span>`;
       btn.addEventListener("click", () => {
         if (d.active) return;
         send({ type: "select", id: d.id });
-        setStatus(`Switching to ${d.name}…`, "wait");
+        setStatus(`Switching preview to ${d.name}…`, "wait");
       });
+
+      const actions = document.createElement("div");
+      actions.className = "device-actions";
+
+      const openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.textContent = "Open view";
+      openBtn.disabled = d.state !== "live";
+      openBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        window.open(viewURL(d.id), "_blank", "noopener");
+      });
+
+      const copyViewBtn = document.createElement("button");
+      copyViewBtn.type = "button";
+      copyViewBtn.textContent = "Copy OBS URL";
+      copyViewBtn.disabled = d.state !== "live";
+      copyViewBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const url = viewURL(d.id);
+        try {
+          await navigator.clipboard.writeText(url);
+          copyViewBtn.textContent = "Copied";
+          setTimeout(() => { copyViewBtn.textContent = "Copy OBS URL"; }, 1500);
+        } catch {
+          copyViewBtn.textContent = "Copy failed";
+        }
+      });
+
+      actions.appendChild(openBtn);
+      actions.appendChild(copyViewBtn);
       li.appendChild(btn);
+      li.appendChild(actions);
       listEl.appendChild(li);
     }
   }
@@ -241,7 +230,7 @@
       remote.play().catch(() => {});
       setPhoneDisconnectedUI(false);
       const active = devices.find((d) => d.active);
-      setStatus(active ? `Live — ${active.name}` : "Live — phone camera", "live");
+      setStatus(active ? `Preview — ${active.name}` : "Preview — phone camera", "live");
       startStats();
     };
 
@@ -294,16 +283,6 @@
       return;
     }
 
-    if (msg.type === "v4l2") {
-      renderV4L2(msg);
-      return;
-    }
-
-    if (msg.type === "ndi") {
-      renderNDI(msg);
-      return;
-    }
-
     if (msg.type === "codec") {
       renderCodec(msg.codec || msg.message || "h264");
       return;
@@ -343,8 +322,8 @@
         const active = devices.find((d) => d.active);
         setStatus(
           active
-            ? `Active mic — ${active.name} (listen on PC speakers / audio sink)`
-            : "Active mic — listen on PC speakers / audio sink",
+            ? `Active mic — ${active.name} (open view for OBS audio)`
+            : "Active mic — open view for OBS audio",
           "live",
         );
         return;
@@ -407,17 +386,6 @@
       setTimeout(() => { copyBtn.textContent = "Copy phone URL"; }, 1500);
     } catch {
       copyBtn.textContent = "Copy failed";
-    }
-  });
-
-  v4l2Copy.addEventListener("click", async () => {
-    if (!v4l2Command) return;
-    try {
-      await navigator.clipboard.writeText(v4l2Command);
-      v4l2Copy.textContent = "Copied";
-      setTimeout(() => { v4l2Copy.textContent = "Copy command"; }, 1500);
-    } catch {
-      v4l2Copy.textContent = "Copy failed";
     }
   });
 

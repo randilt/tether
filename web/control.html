@@ -7,19 +7,6 @@
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <div id="v4l2-banner" class="v4l2-banner" hidden>
-    <div class="v4l2-banner-body">
-      <p id="v4l2-msg" class="v4l2-msg"></p>
-      <code id="v4l2-cmd" class="v4l2-cmd"></code>
-    </div>
-    <button id="v4l2-copy" type="button">Copy command</button>
-  </div>
-  <div id="ndi-banner" class="ndi-banner" hidden>
-    <div class="ndi-banner-body">
-      <p id="ndi-msg" class="ndi-msg"></p>
-      <p class="ndi-attr">NDI® — <a id="ndi-link" href="https://ndi.video/" target="_blank" rel="noopener">ndi.video</a></p>
-    </div>
-  </div>
   <div id="safety-modal" class="modal" hidden>
     <div class="modal-card">
       <h2>Operator responsibilities</h2>
@@ -27,11 +14,7 @@
         You are responsible for consent and safeguarding when recording or
         streaming people (especially minors). See <code>SAFETY.md</code> in the repo.
       </p>
-      <p>
-        If NDI is enabled, sources are <strong>unencrypted and discoverable on the LAN</strong>.
-        Prefer a private network and <code>-ndi-groups</code>.
-      </p>
-      <p class="modal-note">NDI® is a trademark of Vizrt Group. Check the “Tether” name before commercial branding.</p>
+      <p class="modal-note">Check the “Tether” name before commercial branding.</p>
       <div class="actions">
         <button id="safety-ack" class="primary" type="button">I understand</button>
       </div>
@@ -39,7 +22,7 @@
   </div>
   <header>
     <h1>Tether · Control</h1>
-    <p>Pick which phone feeds the virtual camera. Preview shows the active device. Localhost only.</p>
+    <p>Manage phones. Open a bare view page per phone for OBS Browser Source. Localhost only.</p>
   </header>
   <main class="control-main">
     <aside class="device-panel">
@@ -51,6 +34,13 @@
           <button id="copy-url" type="button">Copy phone URL</button>
         </div>
         <p class="pair-hint" id="pair-hint">Code expires in 10 minutes or after the first phone connects. Control updates automatically.</p>
+      </section>
+      <section class="pair-card">
+        <h2>OBS</h2>
+        <p class="pair-hint" id="obs-hint">
+          Per device: Open view → OBS Browser Source (or Window Capture) →
+          Start Virtual Camera → pick in Zoom/Teams.
+        </p>
       </section>
       <section class="pair-card">
         <h2>Video codec</h2>

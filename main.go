@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 
@@ -20,40 +19,16 @@ import (
 var webFS embed.FS
 
 func main() {
-	v4l2Default := ""
-	audioDefault := ""
-	if runtime.GOOS == "linux" {
-		v4l2Default = "/dev/video10"
-		audioDefault = "pulse:default"
-	}
-
 	addr := flag.String("addr", ":8443", "LAN HTTPS listen address (phone + cert)")
-	controlAddr := flag.String("control", "127.0.0.1:8444", "localhost HTTPS listen for PC control UI")
-	v4l2 := flag.String("v4l2", v4l2Default, "v4l2loopback device (Linux; empty disables virtual cam)")
-	audio := flag.String("audio", audioDefault, "Linux audio sink: pulse:default | alsa:… | empty disables")
-	ndiOn := flag.Bool("ndi", false, "publish each phone camera as an NDI source (requires NDI runtime; LAN-discoverable)")
-	ndiName := flag.String("ndi-name", "TETHER", "NDI source name prefix")
-	ndiGroups := flag.String("ndi-groups", "", "NDI groups (comma-separated); empty = default / public")
-	ndiSize := flag.String("ndi-size", "1280x720", "NDI output size WxH (full UYVY; prefer 720p on Wi-Fi)")
+	controlAddr := flag.String("control", "127.0.0.1:8444", "localhost HTTPS listen for PC control + view pages")
 	flag.Parse()
-
-	ndiW, ndiH, err := parseNDISize(*ndiSize)
-	if err != nil {
-		log.Fatalf("ndi-size: %v", err)
-	}
 
 	certPath, keyPath, err := ensureCert()
 	if err != nil {
 		log.Fatalf("cert: %v", err)
 	}
 
-	hub, err := newHub(*v4l2, *audio, NDIConfig{
-		Enabled: *ndiOn,
-		Prefix:  *ndiName,
-		Groups:  *ndiGroups,
-		Width:   ndiW,
-		Height:  ndiH,
-	})
+	hub, err := newHub()
 	if err != nil {
 		log.Fatalf("webrtc: %v", err)
 	}
@@ -79,8 +54,9 @@ func main() {
 	})
 
 	controlMux := http.NewServeMux()
-	controlMux.HandleFunc("/ws", hub.handleControlWS)
+	controlMux.HandleFunc("/ws", hub.handleControlListenerWS)
 	controlMux.HandleFunc("/control", serveFile(webContent, "control.html"))
+	controlMux.HandleFunc("/view", serveFile(webContent, "view.html"))
 	controlMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.FileServer(http.FS(webContent)).ServeHTTP(w, r)
@@ -90,13 +66,7 @@ func main() {
 	})
 
 	code, phoneURL, _ := hub.pairSnapshot()
-	printURLs(*addr, *controlAddr, *v4l2, *audio, code, phoneBase, phoneURL, NDIConfig{
-		Enabled: *ndiOn,
-		Prefix:  *ndiName,
-		Groups:  *ndiGroups,
-		Width:   ndiW,
-		Height:  ndiH,
-	})
+	printURLs(*addr, *controlAddr, code, phoneBase, phoneURL)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -118,25 +88,70 @@ func main() {
 }
 
 func phonePublicBase(addr string) string {
-	_, port, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		port = "8443"
+		return "https://localhost:8443"
 	}
-	if lan := lanIPv4s(); len(lan) > 0 {
-		return fmt.Sprintf("https://%s:%s", lan[0], port)
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		if ip := firstLANIPv4(); ip != "" {
+			host = ip
+		} else {
+			host = "localhost"
+		}
 	}
-	return fmt.Sprintf("https://localhost:%s", port)
+	return fmt.Sprintf("https://%s", net.JoinHostPort(host, port))
+}
+
+func firstLANIPv4() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			ip = ip.To4()
+			if ip == nil {
+				continue
+			}
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 func serveFile(fsys fs.FS, name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		data, err := fs.ReadFile(fsys, name)
+		b, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			http.NotFound(w, r)
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(data)
+		switch {
+		case strings.HasSuffix(name, ".html"):
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		case strings.HasSuffix(name, ".js"):
+			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		case strings.HasSuffix(name, ".css"):
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		}
+		_, _ = w.Write(b)
 	}
 }
 
@@ -151,94 +166,32 @@ func serveCertDER(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func printURLs(phoneAddr, controlAddr, v4l2Device, audioDest, pairCode, phoneBase, phoneURL string, ndiCfg NDIConfig) {
+func printURLs(phoneAddr, controlAddr, pairCode, phoneBase, phoneURL string) {
 	fmt.Println()
-	fmt.Println("Tether — phone → WebRTC → NDI / v4l2 / audio")
-	fmt.Println("────────────────────────────────────────────")
-	fmt.Printf("  Pairing code: %s  (expires in %s or after first use)\n", pairCode, pairCodeTTL)
-	fmt.Printf("  PC control:   https://%s/control  (localhost only)\n", controlAddr)
-	fmt.Printf("  Phone URL:    %s\n", phoneURL)
-	fmt.Printf("  Install cert: %s/cert.cer\n", phoneBase)
-	if ndiCfg.Enabled {
-		fmt.Printf("  NDI:          ON  prefix=%q size=%dx%d groups=%q\n",
-			ndiCfg.Prefix, ndiCfg.Width, ndiCfg.Height, ndiCfg.Groups)
-		fmt.Println("               Sources are LAN-discoverable (unencrypted). Use -ndi-groups in production.")
-		fmt.Println("               https://ndi.video/")
-	} else {
-		fmt.Println("  NDI:          off  (pass -ndi to publish each phone as an NDI source)")
-	}
-	if v4l2Device != "" {
-		fmt.Printf("  Virtual cam:  %s\n", v4l2Device)
-		if _, err := os.Stat(v4l2Device); err != nil {
-			fmt.Printf("  ERROR: %s missing — control page shows fix command\n", v4l2Device)
-			fmt.Printf("         %s\n", v4l2FixCommand(v4l2Device))
-		}
-	} else {
-		fmt.Println("  Virtual cam:  disabled")
-	}
-	if audioDest != "" {
-		fmt.Printf("  Audio sink:   %s\n", audioDest)
-	} else {
-		fmt.Println("  Audio sink:   disabled")
-	}
-
-	_, phonePort, _ := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(phoneBase, "https://"), "http://"))
-	if phonePort == "" {
-		phonePort = "8443"
-	}
-	for _, ip := range lanIPv4s() {
-		alt := fmt.Sprintf("https://%s:%s/phone?t=%s", ip, phonePort, pairCode)
-		if alt == phoneURL {
-			continue
-		}
-		fmt.Printf("  Phone (alt):  %s\n", alt)
-	}
-
+	fmt.Println("Tether — phone → WebRTC → OBS view pages")
 	fmt.Println()
-	fmt.Println("Scan with phone camera (pairing URL):")
-	qrterminal.GenerateWithConfig(phoneURL, qrterminal.Config{
-		Level:      qrterminal.M,
-		Writer:     os.Stdout,
-		HalfBlocks: true,
-		QuietZone:  1,
-	})
-	fmt.Println("Codes expire after 10 minutes or first successful pair; control page updates live.")
-	fmt.Println("Open control on this PC only (not from other LAN devices).")
-	fmt.Println("First time on iPhone: open /cert.cer, install + Full Trust (see README).")
+	fmt.Printf("  Phone (LAN):  https://%s/phone\n", listenHostPort(phoneAddr))
+	fmt.Printf("  Pair URL:     %s\n", phoneURL)
+	fmt.Printf("  Pair code:    %s\n", pairCode)
+	fmt.Printf("  Control:      https://%s/control\n", listenHostPort(controlAddr))
+	fmt.Printf("  View (OBS):   https://%s/view?id=<deviceId>\n", listenHostPort(controlAddr))
+	fmt.Println()
+	fmt.Println("  OBS: Browser Source → view URL → Start Virtual Camera → Zoom")
+	fmt.Println()
+	if phoneBase != "" {
+		fmt.Println("  Pair QR:")
+		qrterminal.GenerateHalfBlock(phoneURL, qrterminal.L, os.Stdout)
+	}
 	fmt.Println()
 }
 
-func lanIPv4s() []string {
-	var out []string
-	ifaces, err := net.Interfaces()
+func listenHostPort(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		return out
+		return addr
 	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.To4() == nil || ip.IsLinkLocalUnicast() {
-				continue
-			}
-			s := ip.String()
-			if strings.HasPrefix(s, "172.17.") {
-				continue
-			}
-			out = append(out, s)
-		}
+	if host == "" || host == "0.0.0.0" {
+		host = "0.0.0.0"
 	}
-	return out
+	return net.JoinHostPort(host, port)
 }

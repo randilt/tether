@@ -41,16 +41,3 @@ func phonePairURL(base, code string) string {
 	}
 	return fmt.Sprintf("%s/phone?t=%s", base, code)
 }
-
-func v4l2FixCommand(device string) string {
-	nr := "10"
-	if strings.HasPrefix(device, "/dev/video") {
-		if n := strings.TrimPrefix(device, "/dev/video"); n != "" {
-			nr = n
-		}
-	}
-	return fmt.Sprintf(
-		"sudo modprobe v4l2loopback devices=1 video_nr=%s card_label=Tether exclusive_caps=1",
-		nr,
-	)
-}
