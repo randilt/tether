@@ -88,8 +88,13 @@
     <!-- Success -->
     <section id="connected" class="connected" hidden>
       <p class="connected-title">Connected</p>
-      <p class="connected-body">You can put your phone down now.</p>
-      <p class="connected-sub">Your PC is using this phone. Keep this page open.</p>
+      <p class="connected-body">Keep this page open and the screen on.</p>
+      <p class="connected-sub">
+        The browser stops the camera if you switch apps or lock the phone.
+        For a tripod: leave Safari here, and use Guided Access (iOS) or set
+        screen timeout to Never (Android).
+      </p>
+      <video id="wake-fallback" class="wake-fallback" playsinline muted loop hidden></video>
       <div class="actions">
         <button id="disconnect" type="button">Disconnect</button>
       </div>

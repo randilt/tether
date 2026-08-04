@@ -13,6 +13,18 @@
   const v4l2Msg = document.getElementById("v4l2-msg");
   const v4l2Cmd = document.getElementById("v4l2-cmd");
   const v4l2Copy = document.getElementById("v4l2-copy");
+  const ndiBanner = document.getElementById("ndi-banner");
+  const ndiMsg = document.getElementById("ndi-msg");
+  const ndiLink = document.getElementById("ndi-link");
+  const safetyModal = document.getElementById("safety-modal");
+  const safetyAck = document.getElementById("safety-ack");
+  const codecH264 = document.getElementById("codec-h264");
+  const codecVP8 = document.getElementById("codec-vp8");
+  const codecStatus = document.getElementById("codec-status");
+
+  const SAFETY_FLAG = "tether_safety_ack_v1";
+  const NDI_WARN_FLAG = "tether_ndi_lan_ack_v1";
+  let preferredCodec = "h264";
 
   /** @type {RTCPeerConnection | null} */
   let pc = null;
@@ -96,6 +108,35 @@
     v4l2Copy.hidden = !v4l2Command;
   }
 
+  function renderNDI(msg) {
+    if (!msg.enabled) {
+      ndiBanner.hidden = true;
+      return;
+    }
+    ndiBanner.hidden = false;
+    if (msg.url) ndiLink.href = msg.url;
+    if (msg.available === false) {
+      ndiMsg.textContent = msg.message || "NDI enabled but runtime missing";
+      ndiMsg.dataset.state = "error";
+      return;
+    }
+    ndiMsg.dataset.state = "live";
+    ndiMsg.textContent = msg.message || "NDI on — each live phone publishes a source (see device list). OBS/vMix can switch between them.";
+    try {
+      if (localStorage.getItem(NDI_WARN_FLAG) !== "1") {
+        alert("NDI is enabled: sources are unencrypted and discoverable on this LAN. Prefer -ndi-groups on shared Wi‑Fi. See SAFETY.md.");
+        localStorage.setItem(NDI_WARN_FLAG, "1");
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function renderCodec(codec) {
+    preferredCodec = codec === "vp8" ? "vp8" : "h264";
+    codecStatus.textContent = `Preferred: ${preferredCodec === "vp8" ? "VP8" : "H.264"} (next phone connect/resume)`;
+  }
+
   function wsURL() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     return `${proto}//${location.host}/ws?role=control`;
@@ -120,6 +161,7 @@
         `<span class="device-name">${escapeHtml(d.name)}</span>` +
         `<span class="device-meta">${escapeHtml(d.capability)} · ${escapeHtml(d.state)}` +
         (d.active ? " · active" : "") +
+        (d.ndi ? ` · NDI: ${escapeHtml(d.ndi)}` : "") +
         `</span>` +
         `<span class="device-id">${escapeHtml(d.id)}</span>`;
       btn.addEventListener("click", () => {
@@ -257,6 +299,16 @@
       return;
     }
 
+    if (msg.type === "ndi") {
+      renderNDI(msg);
+      return;
+    }
+
+    if (msg.type === "codec") {
+      renderCodec(msg.codec || msg.message || "h264");
+      return;
+    }
+
     if (msg.type === "devices") {
       devices = Array.isArray(msg.devices) ? msg.devices : [];
       renderDevices();
@@ -367,6 +419,25 @@
     } catch {
       v4l2Copy.textContent = "Copy failed";
     }
+  });
+
+  codecH264.addEventListener("click", () => send({ type: "codec", codec: "h264" }));
+  codecVP8.addEventListener("click", () => send({ type: "codec", codec: "vp8" }));
+
+  try {
+    if (localStorage.getItem(SAFETY_FLAG) !== "1") {
+      safetyModal.hidden = false;
+    }
+  } catch {
+    safetyModal.hidden = false;
+  }
+  safetyAck.addEventListener("click", () => {
+    try {
+      localStorage.setItem(SAFETY_FLAG, "1");
+    } catch {
+      /* ignore */
+    }
+    safetyModal.hidden = true;
   });
 
   connect();

@@ -1,8 +1,10 @@
 # Tether
 
-Phone browser → WebRTC → Linux PC virtual webcam (`v4l2loopback`) and/or mic audio.
-Multiple phones can connect; the control page picks which one is active.
-Capabilities per device: `video`, `audio`, or `av`.
+Phone browser → WebRTC → PC. **Zero phone app install.**
+
+- **NDI (opt-in):** each connected phone publishes as its own NDI source — OBS/vMix switch cameras for events
+- **Linux:** active phone can also feed `v4l2loopback` (Zoom/Teams-style single webcam) + Pulse/ALSA hear-back
+- Pairing code/QR; multi-device registry; control UI on localhost
 
 ## Install (Linux)
 
@@ -21,15 +23,49 @@ bash install.sh
 
 The script builds the `tether` binary into `~/.local/bin`, checks for `ffmpeg` / `v4l2loopback`, prints the right package command for apt/dnf/pacman when something’s missing, and **asks before any sudo** (shows the exact command). No `.deb`/AUR yet.
 
+Cross-platform binaries (when released):
+
+```bash
+goreleaser build --snapshot --clean   # or download a GitHub Release
+```
+
+## Windows / macOS (NDI path)
+
+The Go server runs on Windows and macOS. There is **no** built-in virtual webcam driver on those OSes — use NDI:
+
+1. Install [ffmpeg](https://ffmpeg.org/) on PATH.
+2. Install the [NDI runtime / SDK](https://ndi.video/for-developers/ndi-sdk/) (dynamic load — not bundled).
+3. Run: `tether -ndi -v4l2 "" -audio ""`
+4. In **OBS**: add an NDI Source (DistroAV / obs-ndi) for each phone, or feed **OBS Virtual Camera**.
+5. For Zoom/Teams on Windows/macOS: install [NDI Tools](https://ndi.video/tools/) → **NDI Virtual Input**, or use OBS Virtual Camera.
+
+### macOS Sonoma+ caveats
+
+NDI Virtual Input has had camera-extension / Sonoma breakage (duplicate extensions, legacy camera plugins). If Virtual Input does not appear as a webcam, prefer **OBS Virtual Camera** fed by an NDI source. See Vizrt’s NDI Tools docs for recovery/extension fixes.
+
+## NDI (multi-phone / events)
+
+```bash
+tether -ndi -ndi-name TETHER -ndi-size 1280x720
+# optional: -ndi-groups school-gym   # keep sources off the public default group
+```
+
+Each live phone becomes e.g. `TETHER (iPhone a1b2c3d4)`. OBS can show all of them and switch live.
+
+**Security:** NDI is unencrypted and mDNS-discoverable on the LAN. Treat `-ndi` as explicit opt-in; use `-ndi-groups` on shared Wi‑Fi. Attribution: [ndi.video](https://ndi.video/).
+
+Budget: full-bandwidth UYVY NDI is roughly 60–125 Mbps per 720p/1080p source — fine on loopback; prefer wired gigabit between PCs.
+
 ## Requirements
 
 - Go 1.24+ (toolchain auto-downloads if needed)
 - `ffmpeg` on PATH
-- Linux PC and phone on the same Wi‑Fi/LAN
+- Phone and PC on the same Wi‑Fi/LAN
 - Phone browser with `getUserMedia` + WebRTC (Safari on iOS is fine)
-- For hearing mic audio: PulseAudio/PipeWire (`-audio pulse:default`, the default) or ALSA
+- Linux virtual cam: `v4l2loopback`; Linux mic hear-back: Pulse/PipeWire or ALSA
+- NDI: separate NDI runtime when using `-ndi`
 
-## One-time: v4l2loopback
+## One-time: v4l2loopback (Linux)
 
 ```bash
 sudo apt install v4l2loopback-dkms ffmpeg   # or your distro’s equivalents
@@ -128,9 +164,10 @@ Camera / multi-device / pairing still work as before (`video` / `av` capabilitie
 
 ## Notes
 
+- See [SAFETY.md](./SAFETY.md) for consent, NDI LAN risk, codecs, and trademark notes.
 - LAN-only media: no STUN/TURN (`iceServers: []`).
 - Control UI is not LAN-reachable by default (`-control 127.0.0.1:8444`).
-- Active device drives both v4l2 (if it has video) and the audio sink (if it has audio).
-- Virtual cam path is H264-only (iPhone Safari).
-- Audio path: Opus RTP → Ogg → ffmpeg → Pulse/ALSA (low-latency flags).
-- **iPhone → Linux Chrome preview:** Chrome often can’t decode H264 → black `<video>`. Firefox usually works. OBS/Zoom use the v4l2 path.
+- Active device drives v4l2 (Linux) when it has video; with `-ndi`, **every** live camera phone publishes an NDI source.
+- Virtual cam path accepts H264 or VP8 (H264 default for phone battery).
+- Audio path (Linux): Opus RTP → Ogg → ffmpeg → Pulse/ALSA.
+- **iPhone → Linux Chrome preview:** Chrome often can’t decode H264 → black `<video>`. Firefox usually works. OBS/Zoom use v4l2 or NDI.

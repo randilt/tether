@@ -78,6 +78,89 @@ body {
   color: #f0d2b8;
 }
 
+.ndi-banner {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 0.75rem 1.5rem;
+  background: #102018;
+  border-bottom: 1px solid #2a4a38;
+  color: #b8e0c8;
+}
+
+.ndi-banner[hidden] {
+  display: none !important;
+}
+
+.ndi-banner-body {
+  flex: 1;
+  min-width: 12rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.ndi-msg {
+  margin: 0;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.ndi-attr {
+  margin: 0;
+  font-size: 0.78rem;
+  color: #7a9a88;
+}
+
+.ndi-attr a {
+  color: #9fd4b4;
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(0, 0, 0, 0.65);
+}
+
+.modal[hidden] {
+  display: none !important;
+}
+
+.modal-card {
+  max-width: 28rem;
+  padding: 1.25rem 1.35rem;
+  background: #151b21;
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.modal-card h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.modal-card p {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.modal-note {
+  font-size: 0.8rem !important;
+  color: #5c6a75 !important;
+}
+
 header {
   flex: 0 0 auto;
   padding: 1.25rem 1.5rem 0.5rem;
@@ -284,6 +367,15 @@ a.button.primary {
   margin: 0.25rem 0 0.5rem;
   font-size: 0.85rem;
   color: var(--muted);
+  line-height: 1.45;
+}
+
+.wake-fallback {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .gate {

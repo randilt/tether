@@ -12,6 +12,7 @@ require (
 )
 
 require (
+	github.com/ebitengine/purego v0.8.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.6.2 // indirect
 	github.com/pion/dtls/v3 v3.1.5 // indirect

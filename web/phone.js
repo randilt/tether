@@ -18,6 +18,7 @@
   const stopBtn = document.getElementById("stop");
   const disconnectBtn = document.getElementById("disconnect");
   const camActions = document.getElementById("cam-actions");
+  const wakeFallback = document.getElementById("wake-fallback");
 
   /** @type {RTCPeerConnection | null} */
   let pc = null;
@@ -35,6 +36,10 @@
   let reconnectTimer = null;
   let reconnectAttempt = 0;
   let wsGen = 0;
+  /** @type {WakeLockSentinel | null} */
+  let wakeLock = null;
+  /** @type {"h264" | "vp8"} */
+  let preferCodec = "h264";
 
   function selectedMode() {
     const el = document.querySelector('input[name="mode"]:checked');
@@ -104,6 +109,7 @@
     camActions.hidden = true;
     headerSub.textContent = "You’re all set.";
     document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = true; });
+    acquireWakeLock();
   }
 
   function showReconnecting() {
@@ -112,6 +118,67 @@
     camActions.hidden = true;
     headerSub.textContent = "Reconnecting to your PC…";
     setStatus("Phone disconnected — reconnecting…", "wait");
+  }
+
+  // Keep screen on while live. Browser still kills capture if you switch apps —
+  // Wake Lock only helps while this page stays foregrounded.
+  async function acquireWakeLock() {
+    if (!wantLive) return;
+    startWakeFallback();
+    if (!("wakeLock" in navigator) || !navigator.wakeLock) return;
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => {
+        wakeLock = null;
+      });
+    } catch (err) {
+      console.warn("wakeLock", err);
+    }
+  }
+
+  async function releaseWakeLock() {
+    stopWakeFallback();
+    if (!wakeLock) return;
+    try {
+      await wakeLock.release();
+    } catch {
+      /* ignore */
+    }
+    wakeLock = null;
+  }
+
+  function startWakeFallback() {
+    if (!wakeFallback) return;
+    // Tiny silent looping video — fallback when Wake Lock silently no-ops (older iOS PWA).
+    if (!wakeFallback.src) {
+      // 1x1 black pixel webm is heavy; use a canvas-generated silent stream instead.
+      try {
+        const c = document.createElement("canvas");
+        c.width = 2;
+        c.height = 2;
+        const ctx = c.getContext("2d");
+        if (ctx) {
+          ctx.fillStyle = "#000";
+          ctx.fillRect(0, 0, 2, 2);
+        }
+        const stream = c.captureStream(1);
+        wakeFallback.srcObject = stream;
+      } catch {
+        return;
+      }
+    }
+    wakeFallback.hidden = true;
+    wakeFallback.muted = true;
+    wakeFallback.play().catch(() => {});
+  }
+
+  function stopWakeFallback() {
+    if (!wakeFallback) return;
+    wakeFallback.pause();
+    if (wakeFallback.srcObject) {
+      for (const t of wakeFallback.srcObject.getTracks()) t.stop();
+      wakeFallback.srcObject = null;
+    }
   }
 
   function wsURL(useResume) {
@@ -265,6 +332,12 @@
 
     if (msg.type === "status" && msg.message === "ready") {
       if (msg.resume) resumeToken = msg.resume;
+      if (msg.codec === "vp8" || msg.codec === "h264") preferCodec = msg.codec;
+      return;
+    }
+
+    if (msg.type === "codec") {
+      if (msg.codec === "vp8" || msg.codec === "h264") preferCodec = msg.codec;
       return;
     }
 
@@ -291,11 +364,33 @@
     }
   }
 
+  function preferVideoCodec(peer) {
+    if (!peer || typeof RTCRtpSender === "undefined" || !RTCRtpSender.getCapabilities) return;
+    const caps = RTCRtpSender.getCapabilities("video");
+    if (!caps || !caps.codecs || !caps.codecs.length) return;
+    const want = preferCodec === "vp8" ? "video/vp8" : "video/h264";
+    const ordered = [...caps.codecs].sort((a, b) => {
+      const am = (a.mimeType || "").toLowerCase() === want ? 0 : 1;
+      const bm = (b.mimeType || "").toLowerCase() === want ? 0 : 1;
+      return am - bm;
+    });
+    for (const t of peer.getTransceivers()) {
+      if (t.sender && t.sender.track && t.sender.track.kind === "video") {
+        try {
+          t.setCodecPreferences(ordered);
+        } catch (err) {
+          console.warn("setCodecPreferences", err);
+        }
+      }
+    }
+  }
+
   async function bindPeerAndOffer() {
     pc = new RTCPeerConnection({ iceServers: [] });
     for (const track of localStream.getTracks()) {
       pc.addTrack(track, localStream);
     }
+    preferVideoCodec(pc);
 
     pc.onicecandidate = (e) => {
       if (!e.candidate) return;
@@ -392,6 +487,7 @@
     resumeToken = "";
     reconnectAttempt = 0;
     clearReconnectTimer();
+    await releaseWakeLock();
     stopBtn.disabled = true;
     connectedEl.hidden = true;
     camActions.hidden = false;
@@ -439,14 +535,18 @@
   disconnectBtn.addEventListener("click", () => stop(true));
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
-    if (!wantLive || !resumeToken) return;
-    const wsDead = !ws || ws.readyState !== WebSocket.OPEN;
-    const pcDead = !pc || pc.connectionState === "failed" || pc.connectionState === "closed"
-      || pc.connectionState === "disconnected";
-    if (wsDead || pcDead) {
-      scheduleReconnect("tab visible");
+    if (document.visibilityState === "visible") {
+      if (wantLive) acquireWakeLock();
+      if (!wantLive || !resumeToken) return;
+      const wsDead = !ws || ws.readyState !== WebSocket.OPEN;
+      const pcDead = !pc || pc.connectionState === "failed" || pc.connectionState === "closed"
+        || pc.connectionState === "disconnected";
+      if (wsDead || pcDead) {
+        scheduleReconnect("tab visible");
+      }
+      return;
     }
+    // Hidden: OS will release wake lock; capture will stop — resume handles recovery.
   });
 
   window.addEventListener("pageshow", (ev) => {

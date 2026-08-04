@@ -18,7 +18,6 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"nhooyr.io/websocket"
 )
@@ -47,6 +46,8 @@ type signalMsg struct {
 	Command    string       `json:"command,omitempty"`
 	Device     string       `json:"device,omitempty"`
 	ExpiresAt  int64        `json:"expiresAt,omitempty"`
+	Enabled    *bool        `json:"enabled,omitempty"`
+	Codec      string       `json:"codec,omitempty"`
 }
 
 const phoneResumeGrace = 90 * time.Second
@@ -57,6 +58,7 @@ type deviceInfo struct {
 	Capability string `json:"capability"`
 	State      string `json:"state"`
 	Active     bool   `json:"active"`
+	NDI        string `json:"ndi,omitempty"`
 }
 
 type device struct {
@@ -75,6 +77,8 @@ type device struct {
 	AudioRemote *webrtc.TrackRemote
 	AudioRate   uint32
 	AudioChans  uint16
+	pipe        *videoPipeline
+	NDIName     string
 }
 
 func (d *device) capability() string {
@@ -94,10 +98,18 @@ type Hub struct {
 	audioDest    string
 	phoneBaseURL string
 
+	ndiEnabled bool
+	ndiPrefix  string
+	ndiGroups  string
+	ndiWidth   int
+	ndiHeight  int
+	ndiOK      bool
+	ndiMsg     string
+	videoCodec string // h264 | vp8
+
 	mu          sync.Mutex
 	devices     map[string]*device
 	activeID    string
-	vcam        *vcam
 	asink       *asink
 	v4l2OK      bool
 	v4l2Msg     string
@@ -108,7 +120,7 @@ type Hub struct {
 	controlGen  int
 }
 
-func newHub(v4l2Device, audioDest string) (*Hub, error) {
+func newHub(v4l2Device, audioDest string, ndi NDIConfig) (*Hub, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, err
@@ -150,6 +162,8 @@ func newHub(v4l2Device, audioDest string) (*Hub, error) {
 		audioDest:  audioDest,
 		devices:    make(map[string]*device),
 	}
+	h.applyNDIConfig(ndi)
+	h.videoCodec = "h264"
 	h.refreshV4L2Status()
 	h.mu.Lock()
 	err := h.rotatePairLocked("startup")
@@ -385,6 +399,7 @@ func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.C
 		d.ResumeUntil = time.Time{}
 		d.State = "connecting"
 		d.PC = pc
+		h.stopDevicePipeLocked(d)
 		d.HasVideo = false
 		d.HasAudio = false
 		d.VideoRemote = nil
@@ -468,7 +483,7 @@ func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.C
 		}
 	})
 
-	send(signalMsg{Type: "status", Message: "ready", ID: id, Resume: resumeToken})
+	send(signalMsg{Type: "status", Message: "ready", ID: id, Resume: resumeToken, Codec: h.preferredCodec()})
 
 	for {
 		_, data, err := conn.Read(ctx)
@@ -520,11 +535,10 @@ func (h *Hub) handleVideoTrack(ctx context.Context, id string, pc *webrtc.PeerCo
 
 	h.broadcastDevices()
 	if becameActive {
-		h.restartVCamForActive()
+		h.restartVideoPipelines()
 		h.restartAudioForActive()
-	} else if isActive {
-		// Resume after lock/background — activeID was kept, pipes were stopped.
-		h.restartVCamForActive()
+	} else if isActive || h.ndiIsEnabled() {
+		h.restartVideoPipelines()
 	}
 	if isActive || becameActive {
 		h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
@@ -535,7 +549,11 @@ func (h *Hub) handleVideoTrack(ctx context.Context, id string, pc *webrtc.PeerCo
 	})
 	go pliLoop(ctx, pc, remote)
 
-	h264 := &codecs.H264Packet{}
+	depack, derr := newVideoDepacketizer(mime)
+	if derr != nil {
+		log.Printf("phone %s: %v (control preview still works)", id, derr)
+	}
+
 	for {
 		pkt, _, readErr := remote.ReadRTP()
 		if readErr != nil {
@@ -549,14 +567,14 @@ func (h *Hub) handleVideoTrack(ctx context.Context, id string, pc *webrtc.PeerCo
 			}
 		}
 
-		if !strings.Contains(strings.ToLower(mime), "h264") {
+		if depack == nil {
 			continue
 		}
-		nal, uErr := h264.Unmarshal(pkt.Payload)
-		if uErr != nil || len(nal) == 0 {
+		bitstream, uErr := depack.Unmarshal(pkt.Payload)
+		if uErr != nil || len(bitstream) == 0 {
 			continue
 		}
-		h.writeVCam(id, nal)
+		h.writeVideo(id, bitstream)
 	}
 }
 
@@ -594,7 +612,7 @@ func (h *Hub) handleAudioTrack(_ context.Context, id string, remote *webrtc.Trac
 
 	h.broadcastDevices()
 	if becameActive {
-		h.restartVCamForActive()
+		h.restartVideoPipelines()
 		h.restartAudioForActive()
 		if hasVideo {
 			h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
@@ -688,6 +706,8 @@ func (h *Hub) serveControl(ctx context.Context, conn *websocket.Conn, send func(
 
 	send(pairMsg)
 	send(h.v4l2StatusMsg())
+	send(h.ndiStatusMsg())
+	send(signalMsg{Type: "codec", Codec: h.preferredCodec()})
 	send(signalMsg{Type: "devices", Devices: h.snapshotDevices()})
 	switch {
 	case phoneDisconnected:
@@ -724,6 +744,18 @@ func (h *Hub) handleControlSignal(msg signalMsg, send func(signalMsg)) error {
 		if err := h.setActive(msg.ID); err != nil {
 			send(signalMsg{Type: "error", Message: err.Error()})
 		}
+		return nil
+
+	case "codec":
+		codec := msg.Codec
+		if codec == "" {
+			codec = msg.Message
+		}
+		if err := h.setPreferredCodec(codec); err != nil {
+			send(signalMsg{Type: "error", Message: err.Error()})
+			return nil
+		}
+		send(signalMsg{Type: "codec", Codec: h.preferredCodec()})
 		return nil
 
 	case "offer":
@@ -858,7 +890,7 @@ func (h *Hub) setActive(id string) error {
 	h.mu.Unlock()
 
 	log.Printf("active → %s (%s) (was %s)", id, name, prev)
-	h.restartVCamForActive()
+	h.restartVideoPipelines()
 	h.restartAudioForActive()
 	h.broadcastDevices()
 	if hasVideo {
@@ -908,6 +940,7 @@ func (h *Hub) onPhoneSessionEnd(id string, gen int) {
 	until := time.Now().Add(phoneResumeGrace)
 	d.State = "reconnecting"
 	d.PC = nil
+	h.stopDevicePipeLocked(d)
 	d.HasVideo = false
 	d.HasAudio = false
 	d.VideoRemote = nil
@@ -983,7 +1016,7 @@ func (h *Hub) markPhoneLinkUp(id string, gen int) {
 		return
 	}
 	log.Printf("phone %s link up — restarting sinks", id)
-	h.restartVCamForActive()
+	h.restartVideoPipelines()
 	h.restartAudioForActive()
 	if hasVideo {
 		h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
@@ -1023,7 +1056,7 @@ func (h *Hub) removeDevice(id string) {
 	if wasActive {
 		if next != "" {
 			log.Printf("active failover → %s", next)
-			h.restartVCamForActive()
+			h.restartVideoPipelines()
 			h.restartAudioForActive()
 			if nextHasVideo {
 				h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
@@ -1037,52 +1070,90 @@ func (h *Hub) removeDevice(id string) {
 	h.broadcastDevices()
 }
 
-func (h *Hub) restartVCamForActive() {
+func (h *Hub) ndiIsEnabled() bool {
 	h.mu.Lock()
-	h.stopVCamLocked()
-	id := h.activeID
-	devPath := h.v4l2Device
-	var mime string
-	if id != "" {
-		if d := h.devices[id]; d != nil && d.HasVideo {
-			mime = d.VideoMime
+	defer h.mu.Unlock()
+	return h.ndiEnabled
+}
+
+func (h *Hub) restartVideoPipelines() {
+	type snap struct {
+		id, mime, name string
+		active         bool
+	}
+	h.mu.Lock()
+	var list []snap
+	for _, d := range h.devices {
+		h.stopDevicePipeLocked(d)
+		d.NDIName = ""
+		if d.State == "live" && d.HasVideo && videoMIMESupported(d.VideoMime) {
+			list = append(list, snap{id: d.ID, mime: d.VideoMime, name: d.Name, active: d.ID == h.activeID})
 		}
 	}
+	ndiOn := h.ndiEnabled && h.ndiOK
+	ndiPrefix := h.ndiPrefix
+	ndiGroups := h.ndiGroups
+	ndiW, ndiH := h.ndiWidth, h.ndiHeight
+	devPath := h.v4l2Device
 	h.mu.Unlock()
 
 	h.refreshV4L2Status()
-	h.notifyControl(h.v4l2StatusMsg())
 
-	if id == "" || devPath == "" || mime == "" {
-		return
-	}
-	if !h.v4l2DeviceAvailable() {
-		return
-	}
-	if !strings.Contains(strings.ToLower(mime), "h264") {
-		log.Printf("vcam: skip — active %s codec %s (need H264)", id, mime)
-		return
-	}
-
-	cam, err := startVCam(devPath)
-	if err != nil {
-		log.Printf("vcam: %v", err)
-		h.setV4L2Error(fmt.Sprintf("Virtual camera failed — %v", err))
-		h.notifyControl(h.v4l2StatusMsg())
-		return
-	}
-
-	h.mu.Lock()
-	if h.activeID != id {
+	var ndiErr string
+	for _, s := range list {
+		var sinks []videoSink
+		var ndiName string
+		if ndiOn {
+			ndiName = ndiSourceName(ndiPrefix, s.name, s.id)
+			ns, err := newNDISink(ndiName, ndiGroups, ndiW, ndiH)
+			if err != nil {
+				log.Printf("ndi: %v", err)
+				ndiErr = err.Error()
+			} else {
+				sinks = append(sinks, ns)
+			}
+		}
+		if s.active && devPath != "" && h.v4l2DeviceAvailable() {
+			vs, err := newV4L2Sink(devPath)
+			if err != nil {
+				log.Printf("v4l2 sink: %v", err)
+				h.setV4L2Error(fmt.Sprintf("Virtual camera failed — %v", err))
+			} else {
+				sinks = append(sinks, vs)
+			}
+		}
+		if len(sinks) == 0 {
+			continue
+		}
+		pipe, err := startVideoPipeline(s.id, s.mime, sinks)
+		if err != nil {
+			log.Printf("pipeline: %v", err)
+			if s.active {
+				h.setV4L2Error(fmt.Sprintf("Virtual camera failed — %v", err))
+			}
+			continue
+		}
+		h.mu.Lock()
+		d := h.devices[s.id]
+		if d == nil || d.State != "live" {
+			h.mu.Unlock()
+			pipe.Close()
+			continue
+		}
+		d.pipe = pipe
+		d.NDIName = ndiName
+		if s.active && devPath != "" {
+			h.v4l2OK = true
+			h.v4l2Msg = ""
+		}
 		h.mu.Unlock()
-		cam.Close()
-		return
 	}
-	h.vcam = cam
-	h.v4l2OK = true
-	h.v4l2Msg = ""
-	h.mu.Unlock()
+	if ndiErr != "" {
+		h.setNDIError(ndiErr)
+	}
 	h.notifyControl(h.v4l2StatusMsg())
+	h.notifyControl(h.ndiStatusMsg())
+	h.broadcastDevices()
 }
 
 func (h *Hub) refreshV4L2Status() {
@@ -1171,13 +1242,26 @@ func (h *Hub) restartAudioForActive() {
 	h.mu.Unlock()
 }
 
+func (h *Hub) stopDevicePipeLocked(d *device) {
+	if d == nil || d.pipe == nil {
+		return
+	}
+	pid := d.pipe.PID()
+	log.Printf("pipeline: terminating old ffmpeg (pid %d) before replacement", pid)
+	d.pipe.Close()
+	log.Printf("pipeline: old ffmpeg (pid %d) terminated", pid)
+	d.pipe = nil
+}
+
 func (h *Hub) stopVCamLocked() {
-	if h.vcam != nil {
-		pid := h.vcam.PID()
-		log.Printf("vcam: terminating old ffmpeg (pid %d) before replacement", pid)
-		h.vcam.Close()
-		log.Printf("vcam: old ffmpeg (pid %d) terminated", pid)
-		h.vcam = nil
+	if h.activeID == "" {
+		for _, d := range h.devices {
+			h.stopDevicePipeLocked(d)
+		}
+		return
+	}
+	if d := h.devices[h.activeID]; d != nil {
+		h.stopDevicePipeLocked(d)
 	}
 }
 
@@ -1191,20 +1275,21 @@ func (h *Hub) stopAudioLocked() {
 	}
 }
 
-func (h *Hub) writeVCam(deviceID string, nal []byte) {
+func (h *Hub) writeVideo(deviceID string, bitstream []byte) {
 	h.mu.Lock()
-	if h.activeID != deviceID || h.vcam == nil {
+	d := h.devices[deviceID]
+	if d == nil || d.pipe == nil {
 		h.mu.Unlock()
 		return
 	}
-	cam := h.vcam
+	pipe := d.pipe
 	h.mu.Unlock()
 
-	if err := cam.Write(nal); err != nil {
-		log.Printf("vcam write: %v", err)
+	if err := pipe.Write(bitstream); err != nil {
+		log.Printf("pipeline write: %v", err)
 		h.mu.Lock()
-		if h.vcam == cam {
-			h.stopVCamLocked()
+		if d := h.devices[deviceID]; d != nil && d.pipe == pipe {
+			h.stopDevicePipeLocked(d)
 		}
 		h.mu.Unlock()
 	}
@@ -1251,6 +1336,7 @@ func (h *Hub) snapshotDevices() []deviceInfo {
 			Capability: d.capability(),
 			State:      d.State,
 			Active:     d.ID == h.activeID,
+			NDI:        d.NDIName,
 		})
 	}
 	return out

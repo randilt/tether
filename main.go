@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -19,18 +20,40 @@ import (
 var webFS embed.FS
 
 func main() {
+	v4l2Default := ""
+	audioDefault := ""
+	if runtime.GOOS == "linux" {
+		v4l2Default = "/dev/video10"
+		audioDefault = "pulse:default"
+	}
+
 	addr := flag.String("addr", ":8443", "LAN HTTPS listen address (phone + cert)")
 	controlAddr := flag.String("control", "127.0.0.1:8444", "localhost HTTPS listen for PC control UI")
-	v4l2 := flag.String("v4l2", "/dev/video10", "v4l2loopback device (empty disables virtual cam)")
-	audio := flag.String("audio", "pulse:default", "audio sink: pulse:default | alsa:default | alsa:hw:Loopback,0,0 | empty disables")
+	v4l2 := flag.String("v4l2", v4l2Default, "v4l2loopback device (Linux; empty disables virtual cam)")
+	audio := flag.String("audio", audioDefault, "Linux audio sink: pulse:default | alsa:… | empty disables")
+	ndiOn := flag.Bool("ndi", false, "publish each phone camera as an NDI source (requires NDI runtime; LAN-discoverable)")
+	ndiName := flag.String("ndi-name", "TETHER", "NDI source name prefix")
+	ndiGroups := flag.String("ndi-groups", "", "NDI groups (comma-separated); empty = default / public")
+	ndiSize := flag.String("ndi-size", "1280x720", "NDI output size WxH (full UYVY; prefer 720p on Wi-Fi)")
 	flag.Parse()
+
+	ndiW, ndiH, err := parseNDISize(*ndiSize)
+	if err != nil {
+		log.Fatalf("ndi-size: %v", err)
+	}
 
 	certPath, keyPath, err := ensureCert()
 	if err != nil {
 		log.Fatalf("cert: %v", err)
 	}
 
-	hub, err := newHub(*v4l2, *audio)
+	hub, err := newHub(*v4l2, *audio, NDIConfig{
+		Enabled: *ndiOn,
+		Prefix:  *ndiName,
+		Groups:  *ndiGroups,
+		Width:   ndiW,
+		Height:  ndiH,
+	})
 	if err != nil {
 		log.Fatalf("webrtc: %v", err)
 	}
@@ -67,7 +90,13 @@ func main() {
 	})
 
 	code, phoneURL, _ := hub.pairSnapshot()
-	printURLs(*addr, *controlAddr, *v4l2, *audio, code, phoneBase, phoneURL)
+	printURLs(*addr, *controlAddr, *v4l2, *audio, code, phoneBase, phoneURL, NDIConfig{
+		Enabled: *ndiOn,
+		Prefix:  *ndiName,
+		Groups:  *ndiGroups,
+		Width:   ndiW,
+		Height:  ndiH,
+	})
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -122,14 +151,22 @@ func serveCertDER(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func printURLs(phoneAddr, controlAddr, v4l2Device, audioDest, pairCode, phoneBase, phoneURL string) {
+func printURLs(phoneAddr, controlAddr, v4l2Device, audioDest, pairCode, phoneBase, phoneURL string, ndiCfg NDIConfig) {
 	fmt.Println()
-	fmt.Println("Tether — phone → WebRTC → v4l2 / audio")
-	fmt.Println("──────────────────────────────────────")
+	fmt.Println("Tether — phone → WebRTC → NDI / v4l2 / audio")
+	fmt.Println("────────────────────────────────────────────")
 	fmt.Printf("  Pairing code: %s  (expires in %s or after first use)\n", pairCode, pairCodeTTL)
 	fmt.Printf("  PC control:   https://%s/control  (localhost only)\n", controlAddr)
 	fmt.Printf("  Phone URL:    %s\n", phoneURL)
 	fmt.Printf("  Install cert: %s/cert.cer\n", phoneBase)
+	if ndiCfg.Enabled {
+		fmt.Printf("  NDI:          ON  prefix=%q size=%dx%d groups=%q\n",
+			ndiCfg.Prefix, ndiCfg.Width, ndiCfg.Height, ndiCfg.Groups)
+		fmt.Println("               Sources are LAN-discoverable (unencrypted). Use -ndi-groups in production.")
+		fmt.Println("               https://ndi.video/")
+	} else {
+		fmt.Println("  NDI:          off  (pass -ndi to publish each phone as an NDI source)")
+	}
 	if v4l2Device != "" {
 		fmt.Printf("  Virtual cam:  %s\n", v4l2Device)
 		if _, err := os.Stat(v4l2Device); err != nil {
