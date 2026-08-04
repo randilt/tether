@@ -4,6 +4,23 @@ Phone browser → WebRTC → Linux PC virtual webcam (`v4l2loopback`) and/or mic
 Multiple phones can connect; the control page picks which one is active.
 Capabilities per device: `video`, `audio`, or `av`.
 
+## Install (Linux)
+
+From a clone:
+
+```bash
+./install.sh
+```
+
+Fresh machine (saves the script, then runs it — so prompts work):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/randilt/tether/main/install.sh -o install.sh
+bash install.sh
+```
+
+The script builds the `tether` binary into `~/.local/bin`, checks for `ffmpeg` / `v4l2loopback`, prints the right package command for apt/dnf/pacman when something’s missing, and **asks before any sudo** (shows the exact command). No `.deb`/AUR yet.
+
 ## Requirements
 
 - Go 1.24+ (toolchain auto-downloads if needed)
