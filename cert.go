@@ -17,16 +17,17 @@ import (
 
 const (
 	certDir      = "certs"
-	certFile     = "certs/cert.pem"
-	keyFile      = "certs/key.pem"
-	certDERFile  = "certs/cert.cer"
+	certFile     = "certs/cert.pem" // server leaf (+ CA chain)
+	keyFile      = "certs/key.pem"  // server private key
+	caFile       = "certs/ca.pem"
+	certDERFile  = "certs/cert.cer" // CA DER — what the phone installs
 	certValidity = 365 * 24 * time.Hour
 )
 
-// ensureCert creates a self-signed TLS cert (with LAN SANs) on first run.
-// Returns paths to PEM cert and key.
+// ensureCert creates a local CA + server cert (LAN SANs) on first run.
+// /cert.cer serves the CA so iOS Certificate Trust Settings can enable Full Trust.
 func ensureCert() (string, string, error) {
-	if fileExists(certFile) && fileExists(keyFile) {
+	if fileExists(certFile) && fileExists(keyFile) && fileExists(certDERFile) && fileExists(caFile) {
 		return certFile, keyFile, nil
 	}
 
@@ -34,19 +35,51 @@ func ensureCert() (string, string, error) {
 		return "", "", fmt.Errorf("create cert dir: %w", err)
 	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return "", "", fmt.Errorf("generate key: %w", err)
+		return "", "", fmt.Errorf("generate CA key: %w", err)
+	}
+	serverKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("generate server key: %w", err)
 	}
 
-	serial, err := rand.Int(rand.Reader, big.NewInt(1<<62))
+	caSerial, err := rand.Int(rand.Reader, big.NewInt(1<<62))
 	if err != nil {
-		return "", "", fmt.Errorf("serial: %w", err)
+		return "", "", err
+	}
+	serverSerial, err := rand.Int(rand.Reader, big.NewInt(1<<62))
+	if err != nil {
+		return "", "", err
+	}
+
+	caTmpl := &x509.Certificate{
+		SerialNumber: caSerial,
+		Subject: pkix.Name{
+			Organization: []string{"Tether Local"},
+			CommonName:   "Tether Local CA",
+		},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(certValidity),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
+	}
+
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		return "", "", fmt.Errorf("create CA: %w", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return "", "", err
 	}
 
 	hosts := localHosts()
-	tmpl := &x509.Certificate{
-		SerialNumber: serial,
+	serverTmpl := &x509.Certificate{
+		SerialNumber: serverSerial,
 		Subject: pkix.Name{
 			Organization: []string{"Tether Local"},
 			CommonName:   "Tether",
@@ -60,51 +93,59 @@ func ensureCert() (string, string, error) {
 		IPAddresses:           hosts,
 	}
 
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	serverDER, err := x509.CreateCertificate(rand.Reader, serverTmpl, caCert, &serverKey.PublicKey, caKey)
 	if err != nil {
-		return "", "", fmt.Errorf("create cert: %w", err)
+		return "", "", fmt.Errorf("create server cert: %w", err)
 	}
 
+	// TLS leaf + CA (chain) in cert.pem
 	certOut, err := os.OpenFile(certFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return "", "", err
 	}
-	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
-		_ = certOut.Close()
-		return "", "", err
+	for _, der := range [][]byte{serverDER, caDER} {
+		if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
+			_ = certOut.Close()
+			return "", "", err
+		}
 	}
 	if err := certOut.Close(); err != nil {
 		return "", "", err
 	}
 
-	keyBytes, err := x509.MarshalECPrivateKey(key)
+	if err := writePEM(caFile, "CERTIFICATE", caDER, 0o644); err != nil {
+		return "", "", err
+	}
+	// Phone installs the CA (must be a root for iOS Full Trust toggle).
+	if err := os.WriteFile(certDERFile, caDER, 0o644); err != nil {
+		return "", "", fmt.Errorf("write der CA: %w", err)
+	}
+
+	keyBytes, err := x509.MarshalECPrivateKey(serverKey)
 	if err != nil {
 		return "", "", err
 	}
-	keyOut, err := os.OpenFile(keyFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return "", "", err
-	}
-	if err := pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}); err != nil {
-		_ = keyOut.Close()
-		return "", "", err
-	}
-	if err := keyOut.Close(); err != nil {
+	if err := writePEM(keyFile, "EC PRIVATE KEY", keyBytes, 0o600); err != nil {
 		return "", "", err
 	}
 
-	// DER for iOS install via /cert.cer
-	if err := os.WriteFile(certDERFile, der, 0o644); err != nil {
-		return "", "", fmt.Errorf("write der cert: %w", err)
-	}
-
-	fmt.Printf("generated self-signed cert → %s (SANs: localhost", certFile)
+	fmt.Printf("generated CA + server cert → %s (SANs: localhost", certFile)
 	for _, ip := range hosts {
 		fmt.Printf(", %s", ip)
 	}
 	fmt.Println(")")
+	fmt.Println("iPhone: install /cert.cer (CA), then enable Full Trust in Certificate Trust Settings")
 
 	return certFile, keyFile, nil
+}
+
+func writePEM(path, typ string, der []byte, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return pem.Encode(f, &pem.Block{Type: typ, Bytes: der})
 }
 
 func localHosts() []net.IP {

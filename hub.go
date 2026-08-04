@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,9 +55,30 @@ func newHub() (*Hub, error) {
 		return nil, err
 	}
 
+	// Skip docker/VM bridges so ICE prefers real LAN NICs (e.g. 192.168.x).
+	se := webrtc.SettingEngine{}
+	se.SetInterfaceFilter(func(name string) bool {
+		n := strings.ToLower(name)
+		switch {
+		case n == "docker0", n == "lo":
+			return n == "lo" // keep loopback for same-machine /control
+		case strings.HasPrefix(n, "br-"),
+			strings.HasPrefix(n, "veth"),
+			strings.HasPrefix(n, "virbr"),
+			strings.HasPrefix(n, "vmnet"),
+			strings.HasPrefix(n, "vbox"),
+			strings.HasPrefix(n, "zt"),
+			strings.HasPrefix(n, "tailscale"):
+			return false
+		default:
+			return true
+		}
+	})
+
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(mediaEngine),
 		webrtc.WithInterceptorRegistry(registry),
+		webrtc.WithSettingEngine(se),
 	)
 
 	return &Hub{api: api}, nil
