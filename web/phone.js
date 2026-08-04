@@ -203,12 +203,33 @@
   function mediaConstraints(mode) {
     const video = {
       facingMode: { ideal: "environment" },
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
+      width: { ideal: 1920 },
+      height: { ideal: 1080 },
+      frameRate: { ideal: 30 },
     };
     if (mode === "audio") return { audio: true, video: false };
     if (mode === "av") return { audio: true, video };
     return { audio: false, video };
+  }
+
+  /** Push the browser encoder toward a usable bitrate (default WebRTC is call-tier). */
+  async function bumpVideoEncode(peer) {
+    if (!peer) return;
+    for (const sender of peer.getSenders()) {
+      if (!sender.track || sender.track.kind !== "video") continue;
+      const params = sender.getParameters();
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}];
+      }
+      // ~4 Mbps @ 1080p30 — still LAN-friendly; Safari may clamp.
+      params.encodings[0].maxBitrate = 4_000_000;
+      params.encodings[0].maxFramerate = 30;
+      try {
+        await sender.setParameters(params);
+      } catch (err) {
+        console.warn("setParameters bitrate", err);
+      }
+    }
   }
 
   function looksLikeCertOrSecureIssue(err) {
@@ -407,6 +428,7 @@
       const s = pc.connectionState;
       if (s === "connected") {
         reconnectAttempt = 0;
+        bumpVideoEncode(pc);
         setStatus("Live", "live");
         showConnected();
       } else if (s === "failed") {

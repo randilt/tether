@@ -8,6 +8,14 @@ import (
 	"os"
 )
 
+// Fixed output geometry for v4l2loopback. Phone streams are often portrait
+// (e.g. 1080x1920); without an explicit -s, ffmpeg's VIDIOC_G_FMT on a fresh
+// loopback node fails with EINVAL and the whole pipeline dies.
+const (
+	v4l2OutW = 1280
+	v4l2OutH = 720
+)
+
 // v4l2Sink writes decoded raw frames to a v4l2loopback device (Linux).
 type v4l2Sink struct {
 	device string
@@ -30,11 +38,12 @@ func (s *v4l2Sink) WantPipe() bool { return false }
 func (s *v4l2Sink) OutputArgs() []string {
 	return []string{
 		"-an",
+		"-vf", fmt.Sprintf("scale=%d:%d", v4l2OutW, v4l2OutH),
 		"-c:v", "rawvideo",
 		"-pix_fmt", "yuv420p",
-		"-fps_mode", "passthrough",
+		"-s", fmt.Sprintf("%dx%d", v4l2OutW, v4l2OutH),
+		"-r", "30",
 		"-f", "v4l2",
-		"-fflags", "flush_packets",
 		s.device,
 	}
 }

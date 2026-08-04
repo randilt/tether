@@ -94,3 +94,18 @@ func TestNewVideoDepacketizer(t *testing.T) {
 		t.Fatalf("vp8: %v %v", err, d)
 	}
 }
+
+func TestAnnexBHasNALType(t *testing.T) {
+	// 00 00 00 01 | nal_type=7 (SPS)
+	sps := []byte{0, 0, 0, 1, 0x67, 0x42}
+	if !annexBHasNALType(sps, 7) {
+		t.Fatal("expected SPS")
+	}
+	if annexBHasNALType(sps, 5) {
+		t.Fatal("should not report IDR")
+	}
+	idr := []byte{0, 0, 1, 0x65, 0x88}
+	if !annexBHasNALType(idr, 5) {
+		t.Fatal("expected IDR")
+	}
+}
