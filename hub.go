@@ -39,6 +39,7 @@ type signalMsg struct {
 	SDPMLineIx *int         `json:"sdpMLineIndex,omitempty"`
 	Message    string       `json:"message,omitempty"`
 	ID         string       `json:"id,omitempty"`
+	Resume     string       `json:"resume,omitempty"`
 	Devices    []deviceInfo `json:"devices,omitempty"`
 	Code       string       `json:"code,omitempty"`
 	URL        string       `json:"url,omitempty"`
@@ -47,6 +48,8 @@ type signalMsg struct {
 	Device     string       `json:"device,omitempty"`
 	ExpiresAt  int64        `json:"expiresAt,omitempty"`
 }
+
+const phoneResumeGrace = 90 * time.Second
 
 type deviceInfo struct {
 	ID         string `json:"id"`
@@ -57,12 +60,15 @@ type deviceInfo struct {
 }
 
 type device struct {
-	ID         string
-	Name       string
-	State      string // connecting | live
-	PC         *webrtc.PeerConnection
-	HasVideo   bool
-	HasAudio   bool
+	ID          string
+	Name        string
+	State       string // connecting | live | reconnecting
+	Gen         int
+	ResumeToken string
+	ResumeUntil time.Time
+	PC          *webrtc.PeerConnection
+	HasVideo    bool
+	HasAudio    bool
 	VideoRemote *webrtc.TrackRemote
 	VideoLocal  *webrtc.TrackLocalStaticRTP
 	VideoMime   string
@@ -255,6 +261,28 @@ func (h *Hub) tryConsumePairToken(r *http.Request) bool {
 	return true
 }
 
+// authorizePhone accepts either a fresh pairing code or a resume token from a
+// recently dropped live session (phone lock / tab suspend).
+// Returns (resumeDeviceID, ok). resumeDeviceID is empty for a new pair.
+func (h *Hub) authorizePhone(r *http.Request) (resumeID string, ok bool) {
+	if tok := strings.TrimSpace(r.URL.Query().Get("resume")); tok != "" {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		now := time.Now()
+		for _, d := range h.devices {
+			if d.ResumeToken == tok && d.State == "reconnecting" && now.Before(d.ResumeUntil) {
+				log.Printf("phone resume authorized for %s (%s)", d.ID, d.Name)
+				return d.ID, true
+			}
+		}
+		return "", false
+	}
+	if !h.tryConsumePairToken(r) {
+		return "", false
+	}
+	return "", true
+}
+
 func (h *Hub) handlePhoneWS(w http.ResponseWriter, r *http.Request) {
 	h.handleWS(w, r, rolePhone)
 }
@@ -277,9 +305,14 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request, allowed role) {
 		return
 	}
 
-	if rRole == rolePhone && !h.tryConsumePairToken(r) {
-		http.Error(w, "pairing code required or expired", http.StatusForbidden)
-		return
+	resumeID := ""
+	if rRole == rolePhone {
+		var ok bool
+		resumeID, ok = h.authorizePhone(r)
+		if !ok {
+			http.Error(w, "pairing code required or expired", http.StatusForbidden)
+			return
+		}
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -309,7 +342,7 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request, allowed role) {
 
 	switch rRole {
 	case rolePhone:
-		if err := h.servePhone(ctx, r, conn, send); err != nil && !errors.Is(err, context.Canceled) {
+		if err := h.servePhone(ctx, r, conn, send, resumeID); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("phone session: %v", err)
 			send(signalMsg{Type: "error", Message: err.Error()})
 		}
@@ -321,34 +354,72 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request, allowed role) {
 	}
 }
 
-func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.Conn, send func(signalMsg)) error {
-	id, err := newDeviceID()
-	if err != nil {
-		return err
-	}
-	name := phoneName(r)
-
+func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.Conn, send func(signalMsg), resumeID string) error {
 	pc, err := h.api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return err
 	}
 
-	dev := &device{
-		ID:    id,
-		Name:  name,
-		State: "connecting",
-		PC:    pc,
+	resumeToken, err := newResumeToken()
+	if err != nil {
+		_ = pc.Close()
+		return err
 	}
 
+	var id, name string
+	var gen int
+
 	h.mu.Lock()
-	h.devices[id] = dev
+	if resumeID != "" {
+		d := h.devices[resumeID]
+		if d == nil || d.State != "reconnecting" {
+			h.mu.Unlock()
+			_ = pc.Close()
+			return fmt.Errorf("resume session not available")
+		}
+		d.Gen++
+		gen = d.Gen
+		id = d.ID
+		name = d.Name
+		d.ResumeToken = resumeToken
+		d.ResumeUntil = time.Time{}
+		d.State = "connecting"
+		d.PC = pc
+		d.HasVideo = false
+		d.HasAudio = false
+		d.VideoRemote = nil
+		d.VideoLocal = nil
+		d.VideoMime = ""
+		d.AudioRemote = nil
+		d.AudioRate = 0
+		d.AudioChans = 0
+		log.Printf("device resume %s (%s) gen=%d", id, name, gen)
+	} else {
+		id, err = newDeviceID()
+		if err != nil {
+			h.mu.Unlock()
+			_ = pc.Close()
+			return err
+		}
+		name = phoneName(r)
+		dev := &device{
+			ID:          id,
+			Name:        name,
+			State:       "connecting",
+			Gen:         1,
+			ResumeToken: resumeToken,
+			PC:          pc,
+		}
+		gen = 1
+		h.devices[id] = dev
+		log.Printf("device + %s (%s)", id, name)
+	}
 	h.mu.Unlock()
-	log.Printf("device + %s (%s)", id, name)
 	h.broadcastDevices()
 
 	defer func() {
-		h.removeDevice(id)
 		_ = pc.Close()
+		h.onPhoneSessionEnd(id, gen)
 	}()
 
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
@@ -380,6 +451,12 @@ func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.C
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		log.Printf("phone %s peer state: %s", id, s)
+		switch s {
+		case webrtc.PeerConnectionStateDisconnected, webrtc.PeerConnectionStateFailed:
+			h.markPhoneLinkDown(id, gen)
+		case webrtc.PeerConnectionStateConnected:
+			h.markPhoneLinkUp(id, gen)
+		}
 	})
 
 	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -391,7 +468,7 @@ func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.C
 		}
 	})
 
-	send(signalMsg{Type: "status", Message: "ready", ID: id})
+	send(signalMsg{Type: "status", Message: "ready", ID: id, Resume: resumeToken})
 
 	for {
 		_, data, err := conn.Read(ctx)
@@ -445,6 +522,9 @@ func (h *Hub) handleVideoTrack(ctx context.Context, id string, pc *webrtc.PeerCo
 	if becameActive {
 		h.restartVCamForActive()
 		h.restartAudioForActive()
+	} else if isActive {
+		// Resume after lock/background — activeID was kept, pipes were stopped.
+		h.restartVCamForActive()
 	}
 	if isActive || becameActive {
 		h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
@@ -523,6 +603,9 @@ func (h *Hub) handleAudioTrack(_ context.Context, id string, remote *webrtc.Trac
 		}
 	} else if isActive {
 		h.restartAudioForActive()
+		if !hasVideo {
+			h.notifyControl(signalMsg{Type: "status", Message: "audio-only"})
+		}
 	}
 
 	for {
@@ -577,9 +660,15 @@ func (h *Hub) serveControl(ctx context.Context, conn *websocket.Conn, send func(
 	h.controlSend = send
 	hasActive := h.activeLocalLocked() != nil
 	hasAudioOnly := false
+	phoneDisconnected := false
 	if h.activeID != "" {
-		if d := h.devices[h.activeID]; d != nil && d.HasAudio && !d.HasVideo {
-			hasAudioOnly = true
+		if d := h.devices[h.activeID]; d != nil {
+			switch {
+			case d.State == "reconnecting":
+				phoneDisconnected = true
+			case d.HasAudio && !d.HasVideo:
+				hasAudioOnly = true
+			}
 		}
 	}
 	pairMsg := h.pairStatusMsgLocked()
@@ -601,6 +690,8 @@ func (h *Hub) serveControl(ctx context.Context, conn *websocket.Conn, send func(
 	send(h.v4l2StatusMsg())
 	send(signalMsg{Type: "devices", Devices: h.snapshotDevices()})
 	switch {
+	case phoneDisconnected:
+		send(signalMsg{Type: "status", Message: "phone-disconnected"})
 	case hasActive:
 		send(signalMsg{Type: "status", Message: "track-ready"})
 	case hasAudioOnly:
@@ -758,6 +849,7 @@ func (h *Hub) setActive(id string) error {
 		h.broadcastDevices()
 		return nil
 	}
+	prev := h.activeID
 	h.activeID = id
 	hasVideo := d.HasVideo
 	videoRemote := d.VideoRemote
@@ -765,7 +857,7 @@ func (h *Hub) setActive(id string) error {
 	name := d.Name
 	h.mu.Unlock()
 
-	log.Printf("active → %s (%s)", id, name)
+	log.Printf("active → %s (%s) (was %s)", id, name, prev)
 	h.restartVCamForActive()
 	h.restartAudioForActive()
 	h.broadcastDevices()
@@ -780,6 +872,124 @@ func (h *Hub) setActive(id string) error {
 		h.notifyControl(signalMsg{Type: "status", Message: "audio-only"})
 	}
 	return nil
+}
+
+// onPhoneSessionEnd runs when a phone WS/peer session ends. Live sessions enter
+// a reconnect grace window (same resume token) instead of vanishing immediately.
+func (h *Hub) onPhoneSessionEnd(id string, gen int) {
+	h.mu.Lock()
+	d := h.devices[id]
+	if d == nil || d.Gen != gen {
+		h.mu.Unlock()
+		return
+	}
+
+	wasActive := h.activeID == id
+	wasLive := d.State == "live" || d.State == "reconnecting"
+	name := d.Name
+	token := d.ResumeToken
+
+	if !wasLive {
+		delete(h.devices, id)
+		if wasActive {
+			h.activeID = ""
+			h.stopVCamLocked()
+			h.stopAudioLocked()
+		}
+		h.mu.Unlock()
+		log.Printf("device - %s (%s) (never live)", id, name)
+		if wasActive {
+			h.notifyControl(signalMsg{Type: "status", Message: "waiting-for-phone"})
+		}
+		h.broadcastDevices()
+		return
+	}
+
+	until := time.Now().Add(phoneResumeGrace)
+	d.State = "reconnecting"
+	d.PC = nil
+	d.HasVideo = false
+	d.HasAudio = false
+	d.VideoRemote = nil
+	d.VideoLocal = nil
+	d.VideoMime = ""
+	d.AudioRemote = nil
+	d.AudioRate = 0
+	d.AudioChans = 0
+	d.ResumeUntil = until
+	if wasActive {
+		h.stopVCamLocked()
+		h.stopAudioLocked()
+	}
+	h.mu.Unlock()
+
+	log.Printf("device reconnecting %s (%s) — resume grace %s", id, name, phoneResumeGrace)
+	h.notifyControl(signalMsg{Type: "status", Message: "phone-disconnected"})
+	h.broadcastDevices()
+
+	go h.expirePhoneResume(id, gen, token, until)
+}
+
+func (h *Hub) expirePhoneResume(id string, gen int, token string, until time.Time) {
+	timer := time.NewTimer(time.Until(until))
+	defer timer.Stop()
+	<-timer.C
+
+	h.mu.Lock()
+	d := h.devices[id]
+	if d == nil || d.Gen != gen || d.ResumeToken != token || d.State != "reconnecting" {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+	log.Printf("device resume expired %s — removing", id)
+	h.removeDevice(id)
+}
+
+// markPhoneLinkDown is fired on WebRTC disconnected/failed while the phone WS
+// may still be open (or about to die). Stops pipes and tells control to drop
+// the frozen frame.
+func (h *Hub) markPhoneLinkDown(id string, gen int) {
+	h.mu.Lock()
+	d := h.devices[id]
+	if d == nil || d.Gen != gen || d.State != "live" {
+		h.mu.Unlock()
+		return
+	}
+	wasActive := h.activeID == id
+	if wasActive {
+		h.stopVCamLocked()
+		h.stopAudioLocked()
+	}
+	h.mu.Unlock()
+	if wasActive {
+		log.Printf("phone %s link down — notifying control", id)
+		h.notifyControl(signalMsg{Type: "status", Message: "phone-disconnected"})
+	}
+}
+
+func (h *Hub) markPhoneLinkUp(id string, gen int) {
+	h.mu.Lock()
+	d := h.devices[id]
+	if d == nil || d.Gen != gen || d.State != "live" {
+		h.mu.Unlock()
+		return
+	}
+	wasActive := h.activeID == id
+	hasVideo := d.HasVideo
+	hasAudio := d.HasAudio
+	h.mu.Unlock()
+	if !wasActive {
+		return
+	}
+	log.Printf("phone %s link up — restarting sinks", id)
+	h.restartVCamForActive()
+	h.restartAudioForActive()
+	if hasVideo {
+		h.notifyControl(signalMsg{Type: "status", Message: "track-ready"})
+	} else if hasAudio {
+		h.notifyControl(signalMsg{Type: "status", Message: "audio-only"})
+	}
 }
 
 func (h *Hub) removeDevice(id string) {
@@ -963,14 +1173,20 @@ func (h *Hub) restartAudioForActive() {
 
 func (h *Hub) stopVCamLocked() {
 	if h.vcam != nil {
+		pid := h.vcam.PID()
+		log.Printf("vcam: terminating old ffmpeg (pid %d) before replacement", pid)
 		h.vcam.Close()
+		log.Printf("vcam: old ffmpeg (pid %d) terminated", pid)
 		h.vcam = nil
 	}
 }
 
 func (h *Hub) stopAudioLocked() {
 	if h.asink != nil {
+		pid := h.asink.PID()
+		log.Printf("asink: terminating old ffmpeg (pid %d) before replacement", pid)
 		h.asink.Close()
+		log.Printf("asink: old ffmpeg (pid %d) terminated", pid)
 		h.asink = nil
 	}
 }
@@ -1073,6 +1289,14 @@ func pliLoop(ctx context.Context, pc *webrtc.PeerConnection, track *webrtc.Track
 
 func newDeviceID() (string, error) {
 	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func newResumeToken() (string, error) {
+	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
 	}

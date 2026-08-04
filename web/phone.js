@@ -27,6 +27,14 @@
   let localStream = null;
   let starting = false;
   let pairToken = "";
+  /** @type {string} */
+  let resumeToken = "";
+  /** User wants an uplink; auto-reconnect after lock/background. */
+  let wantLive = false;
+  /** @type {number | null} */
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  let wsGen = 0;
 
   function selectedMode() {
     const el = document.querySelector('input[name="mode"]:checked');
@@ -91,16 +99,29 @@
   }
 
   function showConnected() {
-    camEl.hidden = false; // keep preview if video
+    camEl.hidden = false;
     connectedEl.hidden = false;
     camActions.hidden = true;
     headerSub.textContent = "You’re all set.";
     document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = true; });
   }
 
-  function wsURL() {
+  function showReconnecting() {
+    camEl.hidden = false;
+    connectedEl.hidden = true;
+    camActions.hidden = true;
+    headerSub.textContent = "Reconnecting to your PC…";
+    setStatus("Phone disconnected — reconnecting…", "wait");
+  }
+
+  function wsURL(useResume) {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const q = new URLSearchParams({ role: "phone", t: pairToken });
+    const q = new URLSearchParams({ role: "phone" });
+    if (useResume && resumeToken) {
+      q.set("resume", resumeToken);
+    } else {
+      q.set("t", pairToken);
+    }
     const name = new URLSearchParams(location.search).get("name");
     if (name) q.set("name", name);
     return `${proto}//${location.host}/ws?${q}`;
@@ -129,9 +150,7 @@
     if (!window.isSecureContext) return true;
     if (name === "SecurityError" || name === "NotSupportedError") return true;
     if (msg.includes("secure") || msg.includes("ssl") || msg.includes("certificate")) return true;
-    // getUserMedia often fails oddly on untrusted iOS certs
     if (name === "NotAllowedError" && /ios|iphone|ipad/i.test(navigator.userAgent)) {
-      // Could be permission deny OR cert — nudge trust if not marked done
       try {
         return localStorage.getItem(CERT_FLAG) !== "1";
       } catch {
@@ -141,38 +160,99 @@
     return false;
   }
 
-  async function ensureWS() {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-      if (ws.readyState === WebSocket.OPEN) return;
-      await new Promise((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error("ws timeout")), 8000);
-        ws.addEventListener("open", () => { clearTimeout(t); resolve(); }, { once: true });
-        ws.addEventListener("error", () => { clearTimeout(t); reject(new Error("ws error")); }, { once: true });
-      });
+  function clearReconnectTimer() {
+    if (reconnectTimer != null) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+  }
+
+  function scheduleReconnect(reason) {
+    if (!wantLive || !resumeToken || starting) return;
+    if (reconnectAttempt >= 20) {
+      wantLive = false;
+      clearReconnectTimer();
+      setStatus("Could not resume — get a new code from the PC", "error");
+      camActions.hidden = false;
+      connectedEl.hidden = true;
       return;
     }
+    clearReconnectTimer();
+    const delay = Math.min(8000, 500 + reconnectAttempt * 700);
+    reconnectAttempt += 1;
+    showReconnecting();
+    setStatus(`Phone disconnected — reconnecting… (${reason})`, "wait");
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      reconnect().catch((err) => {
+        console.warn("reconnect", err);
+        scheduleReconnect("retry");
+      });
+    }, delay);
+  }
 
-    ws = new WebSocket(wsURL());
-    ws.addEventListener("message", onSignal);
-    ws.addEventListener("close", (ev) => {
-      if (connectedEl.hidden === false) {
-        showCam(pairToken);
-      }
-      if (ev.code === 1008 || ev.code === 1006) {
-        setStatus("Pairing code expired or wrong — get a new code from the PC", "error");
-      } else {
+  function tearDownPeer() {
+    if (pc) {
+      pc.close();
+      pc = null;
+    }
+    if (ws) {
+      const old = ws;
+      ws = null;
+      try { old.close(); } catch { /* ignore */ }
+    }
+  }
+
+  async function ensureMedia() {
+    const live = localStream && localStream.getTracks().some((t) => t.readyState === "live");
+    if (live) return;
+    if (localStream) {
+      for (const t of localStream.getTracks()) t.stop();
+      localStream = null;
+    }
+    localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints(selectedMode()));
+    markCertDone();
+    const hasVideo = localStream.getVideoTracks().length > 0;
+    previewWrap.hidden = !hasVideo;
+    preview.srcObject = hasVideo ? localStream : null;
+  }
+
+  async function openWS(useResume) {
+    const gen = ++wsGen;
+    tearDownPeer();
+    const sock = new WebSocket(wsURL(useResume));
+    ws = sock;
+    sock.addEventListener("message", onSignal);
+    sock.addEventListener("close", (ev) => {
+      if (gen !== wsGen) return;
+      if (!wantLive) {
         setStatus("Disconnected from PC", "error");
+        camActions.hidden = false;
+        return;
       }
-      camActions.hidden = false;
+      if (ev.code === 1008) {
+        wantLive = false;
+        resumeToken = "";
+        setStatus("Pairing/resume rejected — get a new code from the PC", "error");
+        camActions.hidden = false;
+        connectedEl.hidden = true;
+        return;
+      }
+      scheduleReconnect("signaling closed");
     });
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("ws timeout")), 8000);
-      ws.addEventListener("open", () => { clearTimeout(t); resolve(); }, { once: true });
-      ws.addEventListener("error", () => {
+      sock.addEventListener("open", () => { clearTimeout(t); resolve(); }, { once: true });
+      sock.addEventListener("error", () => {
         clearTimeout(t);
-        reject(new Error("Could not connect — pairing code may be wrong or expired"));
+        reject(new Error(useResume
+          ? "Resume failed — unlock and wait, or get a new code"
+          : "Could not connect — pairing code may be wrong or expired"));
       });
     });
+    if (gen !== wsGen) {
+      throw new Error("ws superseded");
+    }
   }
 
   async function onSignal(ev) {
@@ -180,6 +260,11 @@
     try {
       msg = JSON.parse(ev.data);
     } catch {
+      return;
+    }
+
+    if (msg.type === "status" && msg.message === "ready") {
+      if (msg.resume) resumeToken = msg.resume;
       return;
     }
 
@@ -206,64 +291,68 @@
     }
   }
 
+  async function bindPeerAndOffer() {
+    pc = new RTCPeerConnection({ iceServers: [] });
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
+    }
+
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return;
+      send({
+        type: "candidate",
+        candidate: e.candidate.candidate,
+        sdpMid: e.candidate.sdpMid,
+        sdpMLineIndex: e.candidate.sdpMLineIndex,
+      });
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (!pc) return;
+      const s = pc.connectionState;
+      if (s === "connected") {
+        reconnectAttempt = 0;
+        setStatus("Live", "live");
+        showConnected();
+      } else if (s === "failed") {
+        if (wantLive && resumeToken) {
+          scheduleReconnect("webrtc failed");
+        } else {
+          setStatus("Connection failed — tap Start to try again", "error");
+          camActions.hidden = false;
+          connectedEl.hidden = true;
+        }
+      } else if (s === "disconnected") {
+        if (wantLive) {
+          showReconnecting();
+        }
+      }
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({ type: "offer", sdp: offer.sdp });
+  }
+
   async function start() {
     if (starting) return;
     starting = true;
     startBtn.disabled = true;
-    const mode = selectedMode();
+    clearReconnectTimer();
 
     try {
+      wantLive = true;
       setStatus("Waiting for permission… tap Allow", "wait");
-      localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints(mode));
-      markCertDone();
-
-      const hasVideo = localStream.getVideoTracks().length > 0;
-      previewWrap.hidden = !hasVideo;
-      preview.srcObject = hasVideo ? localStream : null;
-
+      await ensureMedia();
       setStatus("Connecting to your PC…", "wait");
-      await ensureWS();
-
-      pc = new RTCPeerConnection({ iceServers: [] });
-      for (const track of localStream.getTracks()) {
-        pc.addTrack(track, localStream);
-      }
-
-      pc.onicecandidate = (e) => {
-        if (!e.candidate) return;
-        send({
-          type: "candidate",
-          candidate: e.candidate.candidate,
-          sdpMid: e.candidate.sdpMid,
-          sdpMLineIndex: e.candidate.sdpMLineIndex,
-        });
-      };
-
-      pc.onconnectionstatechange = () => {
-        const s = pc.connectionState;
-        if (s === "connected") {
-          setStatus("Live", "live");
-          showConnected();
-        } else if (s === "failed") {
-          setStatus("Connection failed — tap Start to try again", "error");
-          camActions.hidden = false;
-          connectedEl.hidden = true;
-        } else if (s === "disconnected") {
-          setStatus("Disconnected", "error");
-          camActions.hidden = false;
-          connectedEl.hidden = true;
-        }
-      };
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      send({ type: "offer", sdp: offer.sdp });
-
+      await openWS(false);
+      await bindPeerAndOffer();
       stopBtn.disabled = false;
       document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = true; });
       setStatus("Almost there…", "wait");
     } catch (err) {
       console.error(err);
+      wantLive = false;
       if (looksLikeCertOrSecureIssue(err)) {
         try {
           localStorage.removeItem(CERT_FLAG);
@@ -283,7 +372,26 @@
     }
   }
 
+  async function reconnect() {
+    if (!wantLive || !resumeToken || starting) return;
+    starting = true;
+    try {
+      showReconnecting();
+      await ensureMedia();
+      await openWS(true);
+      await bindPeerAndOffer();
+      stopBtn.disabled = false;
+      setStatus("Reconnected — negotiating…", "wait");
+    } finally {
+      starting = false;
+    }
+  }
+
   async function stop(resetModes = true) {
+    wantLive = false;
+    resumeToken = "";
+    reconnectAttempt = 0;
+    clearReconnectTimer();
     stopBtn.disabled = true;
     connectedEl.hidden = true;
     camActions.hidden = false;
@@ -293,14 +401,7 @@
     }
     preview.srcObject = null;
     previewWrap.hidden = false;
-    if (pc) {
-      pc.close();
-      pc = null;
-    }
-    if (ws) {
-      ws.close();
-      ws = null;
-    }
+    tearDownPeer();
     if (resetModes) {
       document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = false; });
     }
@@ -319,7 +420,6 @@
   trustDone.addEventListener("click", advancePastTrust);
 
   certLink.addEventListener("click", () => {
-    // After download, nudge them toward Settings without leaving the page copy.
     trustWarn.hidden = false;
     trustWarn.dataset.state = "wait";
     trustWarn.textContent = "Certificate downloading. Now open the Settings app and follow steps 2–6.";
@@ -337,6 +437,22 @@
   startBtn.addEventListener("click", start);
   stopBtn.addEventListener("click", () => stop(true));
   disconnectBtn.addEventListener("click", () => stop(true));
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    if (!wantLive || !resumeToken) return;
+    const wsDead = !ws || ws.readyState !== WebSocket.OPEN;
+    const pcDead = !pc || pc.connectionState === "failed" || pc.connectionState === "closed"
+      || pc.connectionState === "disconnected";
+    if (wsDead || pcDead) {
+      scheduleReconnect("tab visible");
+    }
+  });
+
+  window.addEventListener("pageshow", (ev) => {
+    if (!ev.persisted) return;
+    if (wantLive && resumeToken) scheduleReconnect("pageshow");
+  });
 
   // Entry
   if (!window.isSecureContext) {

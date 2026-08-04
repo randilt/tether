@@ -67,6 +67,13 @@ func startVCam(device string) (*vcam, error) {
 	return &vcam{cmd: cmd, stdin: stdin, device: device}, nil
 }
 
+func (v *vcam) PID() int {
+	if v == nil || v.cmd == nil || v.cmd.Process == nil {
+		return 0
+	}
+	return v.cmd.Process.Pid
+}
+
 func (v *vcam) Write(annexB []byte) error {
 	if len(annexB) == 0 {
 		return nil

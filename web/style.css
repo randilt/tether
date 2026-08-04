@@ -395,6 +395,25 @@ a.button.primary {
   background: #000;
 }
 
+.stage-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1.5rem;
+  text-align: center;
+  background: rgba(5, 7, 8, 0.82);
+  color: var(--warn);
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.stage-overlay[hidden] {
+  display: none !important;
+}
+
 .status {
   flex: 0 0 auto;
   margin: 0;

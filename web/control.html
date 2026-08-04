@@ -34,8 +34,9 @@
       <p id="device-empty" class="status" data-state="wait">No phones connected</p>
     </aside>
     <section class="preview-panel">
-      <div class="stage">
+      <div class="stage" id="stage">
         <video id="remote" playsinline autoplay muted></video>
+        <div id="stage-overlay" class="stage-overlay" hidden>Phone disconnected — reconnecting…</div>
       </div>
       <p id="status" class="status" data-state="wait">Connecting…</p>
       <p id="stats" class="status"> </p>

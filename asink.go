@@ -81,6 +81,13 @@ func startASink(dest string, sampleRate uint32, channels uint16) (*asink, error)
 	return &asink{cmd: cmd, stdin: stdin, ogg: ogg, dest: dest}, nil
 }
 
+func (a *asink) PID() int {
+	if a == nil || a.cmd == nil || a.cmd.Process == nil {
+		return 0
+	}
+	return a.cmd.Process.Pid
+}
+
 func parseAudioDest(dest string) (format, device string, err error) {
 	dest = strings.TrimSpace(dest)
 	switch {

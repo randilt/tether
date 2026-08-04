@@ -2,6 +2,7 @@
   const statusEl = document.getElementById("status");
   const statsEl = document.getElementById("stats");
   const remote = document.getElementById("remote");
+  const stageOverlay = document.getElementById("stage-overlay");
   const listEl = document.getElementById("devices");
   const emptyEl = document.getElementById("device-empty");
   const pairCodeEl = document.getElementById("pair-code");
@@ -31,6 +32,22 @@
   function setStatus(text, state = "wait") {
     statusEl.textContent = text;
     statusEl.dataset.state = state;
+  }
+
+  function setPhoneDisconnectedUI(on) {
+    if (on) {
+      stopStats();
+      if (pc) {
+        pc.close();
+        pc = null;
+      }
+      remote.srcObject = null;
+      statsEl.textContent = "";
+      stageOverlay.hidden = false;
+      setStatus("Phone disconnected — reconnecting…", "wait");
+      return;
+    }
+    stageOverlay.hidden = true;
   }
 
   function updatePairHint() {
@@ -180,6 +197,7 @@
       remote.srcObject = stream;
       remote.muted = true;
       remote.play().catch(() => {});
+      setPhoneDisconnectedUI(false);
       const active = devices.find((d) => d.active);
       setStatus(active ? `Live — ${active.name}` : "Live — phone camera", "live");
       startStats();
@@ -199,7 +217,9 @@
       if (!pc) return;
       const s = pc.connectionState;
       if (s === "failed") setStatus("WebRTC failed — refresh", "error");
-      else if (s === "disconnected") setStatus("Disconnected", "error");
+      else if (s === "disconnected" && stageOverlay.hidden) {
+        setStatus("Link unstable…", "wait");
+      }
     };
   }
 
@@ -245,6 +265,7 @@
 
     if (msg.type === "status") {
       if (msg.message === "waiting-for-phone") {
+        setPhoneDisconnectedUI(false);
         stopStats();
         if (pc) {
           pc.close();
@@ -254,7 +275,12 @@
         setStatus("Waiting for phone to start…", "wait");
         return;
       }
+      if (msg.message === "phone-disconnected") {
+        setPhoneDisconnectedUI(true);
+        return;
+      }
       if (msg.message === "audio-only") {
+        setPhoneDisconnectedUI(false);
         stopStats();
         if (pc) {
           pc.close();
@@ -272,6 +298,7 @@
         return;
       }
       if (msg.message === "track-ready") {
+        setPhoneDisconnectedUI(false);
         setStatus("Active track ready — connecting…", "wait");
         createPC();
         await sendOffer();
