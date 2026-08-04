@@ -8,12 +8,58 @@
 </head>
 <body>
   <header>
-    <h1>Tether · Phone</h1>
-    <p>Share camera, mic, or both over LAN WebRTC.</p>
+    <h1>Tether</h1>
+    <p id="header-sub">Set up once, then share your camera or mic with your PC.</p>
   </header>
-  <main>
-    <section id="gate" class="gate" hidden>
-      <p class="status" data-state="wait">Enter the pairing code from the PC control page.</p>
+  <main class="phone-main">
+    <!-- Step: certificate trust (first-run) -->
+    <section id="trust" class="onboard" hidden>
+      <h2>One-time setup: trust this PC</h2>
+      <p class="onboard-lead">
+        Your phone needs to trust a small security file from your PC.
+        Without this, the camera button will not work.
+      </p>
+      <ol class="onboard-steps">
+        <li>
+          <strong>Tap the button below</strong> to download the certificate file.
+        </li>
+        <li>
+          Open the <strong>Settings</strong> app (grey gears).
+        </li>
+        <li>
+          Near the top, tap <strong>Profile Downloaded</strong>.
+          (If you don’t see it: General → VPN &amp; Device Management.)
+        </li>
+        <li>
+          Tap <strong>Install</strong>, enter your phone passcode if asked,
+          then Install again. Tap Done.
+        </li>
+        <li>
+          Still in Settings: <strong>General → About → Certificate Trust Settings</strong>.
+        </li>
+        <li>
+          Turn <strong>on</strong> Full Trust for <strong>Tether Local CA</strong>.
+        </li>
+        <li>
+          Come back to this Safari tab and tap Continue.
+        </li>
+      </ol>
+      <div class="actions">
+        <a id="cert-link" class="button primary" href="/cert.cer">Download certificate</a>
+        <button id="trust-done" type="button">I’ve finished — Continue</button>
+      </div>
+      <p id="trust-warn" class="status" data-state="error" hidden></p>
+      <p class="onboard-note">
+        If Safari first said “This Connection Is Not Private”: tap
+        <strong>Show Details</strong>, then <strong>visit this website</strong>,
+        then follow the steps above.
+      </p>
+    </section>
+
+    <!-- Step: pairing code (if URL has no ?t=) -->
+    <section id="gate" class="onboard" hidden>
+      <h2>Enter pairing code</h2>
+      <p class="onboard-lead">Type the code shown on your PC screen.</p>
       <form id="pair-form" class="pair-form">
         <input id="pair-input" name="code" type="text" inputmode="text" autocomplete="one-time-code"
                maxlength="12" placeholder="Code" required />
@@ -21,20 +67,31 @@
       </form>
     </section>
 
+    <!-- Step: share media -->
     <section id="cam" hidden>
       <fieldset class="mode-picker">
-        <legend>Share</legend>
+        <legend>What to share</legend>
         <label><input type="radio" name="mode" value="video" checked /> Camera</label>
-        <label><input type="radio" name="mode" value="audio" /> Mic</label>
+        <label><input type="radio" name="mode" value="audio" /> Microphone</label>
         <label><input type="radio" name="mode" value="av" /> Both</label>
       </fieldset>
       <div class="stage" id="preview-wrap">
         <video id="preview" playsinline muted autoplay></video>
       </div>
-      <p id="status" class="status" data-state="wait">Idle — pick a mode and tap Start.</p>
-      <div class="actions">
+      <p id="status" class="status" data-state="wait">Tap Start, then Allow when asked.</p>
+      <div class="actions" id="cam-actions">
         <button id="start" class="primary" type="button">Start</button>
         <button id="stop" type="button" disabled>Stop</button>
+      </div>
+    </section>
+
+    <!-- Success -->
+    <section id="connected" class="connected" hidden>
+      <p class="connected-title">Connected</p>
+      <p class="connected-body">You can put your phone down now.</p>
+      <p class="connected-sub">Your PC is using this phone. Keep this page open.</p>
+      <div class="actions">
+        <button id="disconnect" type="button">Disconnect</button>
       </div>
     </section>
   </main>

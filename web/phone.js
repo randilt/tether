@@ -1,13 +1,23 @@
 (() => {
+  const CERT_FLAG = "tether_cert_trusted_v1";
+
+  const trustEl = document.getElementById("trust");
   const gateEl = document.getElementById("gate");
   const camEl = document.getElementById("cam");
+  const connectedEl = document.getElementById("connected");
+  const headerSub = document.getElementById("header-sub");
   const pairForm = document.getElementById("pair-form");
   const pairInput = document.getElementById("pair-input");
+  const trustDone = document.getElementById("trust-done");
+  const trustWarn = document.getElementById("trust-warn");
+  const certLink = document.getElementById("cert-link");
   const statusEl = document.getElementById("status");
   const preview = document.getElementById("preview");
   const previewWrap = document.getElementById("preview-wrap");
   const startBtn = document.getElementById("start");
   const stopBtn = document.getElementById("stop");
+  const disconnectBtn = document.getElementById("disconnect");
+  const camActions = document.getElementById("cam-actions");
 
   /** @type {RTCPeerConnection | null} */
   let pc = null;
@@ -28,6 +38,66 @@
     statusEl.dataset.state = state;
   }
 
+  function hideAll() {
+    trustEl.hidden = true;
+    gateEl.hidden = true;
+    camEl.hidden = true;
+    connectedEl.hidden = true;
+  }
+
+  function needsCertSetup() {
+    if (!window.isSecureContext) return true;
+    try {
+      if (localStorage.getItem(CERT_FLAG) === "1") return false;
+    } catch {
+      /* private mode */
+    }
+    return true;
+  }
+
+  function markCertDone() {
+    try {
+      localStorage.setItem(CERT_FLAG, "1");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function showTrust(extraWarn) {
+    hideAll();
+    trustEl.hidden = false;
+    headerSub.textContent = "First, trust this PC (one time).";
+    if (extraWarn) {
+      trustWarn.hidden = false;
+      trustWarn.textContent = extraWarn;
+    } else {
+      trustWarn.hidden = true;
+    }
+  }
+
+  function showGate() {
+    hideAll();
+    gateEl.hidden = false;
+    headerSub.textContent = "Enter the code from your PC.";
+  }
+
+  function showCam(token) {
+    pairToken = token.toUpperCase().trim();
+    hideAll();
+    camEl.hidden = false;
+    connectedEl.hidden = true;
+    camActions.hidden = false;
+    headerSub.textContent = "Share camera or mic with your PC.";
+  }
+
+  function showConnected() {
+    camEl.hidden = false; // keep preview if video
+    connectedEl.hidden = false;
+    camActions.hidden = true;
+    headerSub.textContent = "You’re all set.";
+    document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = true; });
+  }
+
   function wsURL() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const q = new URLSearchParams({ role: "phone", t: pairToken });
@@ -42,17 +112,6 @@
     }
   }
 
-  function showCam(token) {
-    pairToken = token.toUpperCase().trim();
-    gateEl.hidden = true;
-    camEl.hidden = false;
-  }
-
-  function showGate() {
-    gateEl.hidden = false;
-    camEl.hidden = true;
-  }
-
   function mediaConstraints(mode) {
     const video = {
       facingMode: { ideal: "environment" },
@@ -62,6 +121,24 @@
     if (mode === "audio") return { audio: true, video: false };
     if (mode === "av") return { audio: true, video };
     return { audio: false, video };
+  }
+
+  function looksLikeCertOrSecureIssue(err) {
+    const name = err && err.name ? err.name : "";
+    const msg = (err && err.message ? err.message : String(err)).toLowerCase();
+    if (!window.isSecureContext) return true;
+    if (name === "SecurityError" || name === "NotSupportedError") return true;
+    if (msg.includes("secure") || msg.includes("ssl") || msg.includes("certificate")) return true;
+    // getUserMedia often fails oddly on untrusted iOS certs
+    if (name === "NotAllowedError" && /ios|iphone|ipad/i.test(navigator.userAgent)) {
+      // Could be permission deny OR cert — nudge trust if not marked done
+      try {
+        return localStorage.getItem(CERT_FLAG) !== "1";
+      } catch {
+        return true;
+      }
+    }
+    return false;
   }
 
   async function ensureWS() {
@@ -78,18 +155,22 @@
     ws = new WebSocket(wsURL());
     ws.addEventListener("message", onSignal);
     ws.addEventListener("close", (ev) => {
-      if (ev.code === 1008 || ev.code === 1006) {
-        setStatus("Pairing rejected — check the code on the PC", "error");
-      } else {
-        setStatus("Signaling disconnected", "error");
+      if (connectedEl.hidden === false) {
+        showCam(pairToken);
       }
+      if (ev.code === 1008 || ev.code === 1006) {
+        setStatus("Pairing code expired or wrong — get a new code from the PC", "error");
+      } else {
+        setStatus("Disconnected from PC", "error");
+      }
+      camActions.hidden = false;
     });
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("ws timeout")), 8000);
       ws.addEventListener("open", () => { clearTimeout(t); resolve(); }, { once: true });
       ws.addEventListener("error", () => {
         clearTimeout(t);
-        reject(new Error("WebSocket failed — wrong pairing code?"));
+        reject(new Error("Could not connect — pairing code may be wrong or expired"));
       });
     });
   }
@@ -132,14 +213,15 @@
     const mode = selectedMode();
 
     try {
-      setStatus(mode === "audio" ? "Requesting microphone…" : "Requesting media…", "wait");
+      setStatus("Waiting for permission… tap Allow", "wait");
       localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints(mode));
+      markCertDone();
 
       const hasVideo = localStream.getVideoTracks().length > 0;
       previewWrap.hidden = !hasVideo;
       preview.srcObject = hasVideo ? localStream : null;
 
-      setStatus("Connecting…", "wait");
+      setStatus("Connecting to your PC…", "wait");
       await ensureWS();
 
       pc = new RTCPeerConnection({ iceServers: [] });
@@ -160,10 +242,17 @@
       pc.onconnectionstatechange = () => {
         const s = pc.connectionState;
         if (s === "connected") {
-          const label = mode === "audio" ? "mic" : mode === "av" ? "camera + mic" : "camera";
-          setStatus(`Live — sending ${label}`, "live");
-        } else if (s === "failed") setStatus("WebRTC failed", "error");
-        else if (s === "disconnected") setStatus("Disconnected", "error");
+          setStatus("Live", "live");
+          showConnected();
+        } else if (s === "failed") {
+          setStatus("Connection failed — tap Start to try again", "error");
+          camActions.hidden = false;
+          connectedEl.hidden = true;
+        } else if (s === "disconnected") {
+          setStatus("Disconnected", "error");
+          camActions.hidden = false;
+          connectedEl.hidden = true;
+        }
       };
 
       const offer = await pc.createOffer();
@@ -172,19 +261,32 @@
 
       stopBtn.disabled = false;
       document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = true; });
-      setStatus("Negotiating…", "wait");
+      setStatus("Almost there…", "wait");
     } catch (err) {
       console.error(err);
-      setStatus(err.message || String(err), "error");
-      await stop();
-      startBtn.disabled = false;
+      if (looksLikeCertOrSecureIssue(err)) {
+        try {
+          localStorage.removeItem(CERT_FLAG);
+        } catch {
+          /* ignore */
+        }
+        showTrust(
+          "Camera/mic was blocked. That usually means the certificate isn’t fully trusted yet. Finish the steps below, then try again.",
+        );
+      } else {
+        setStatus(err.message || String(err), "error");
+        startBtn.disabled = false;
+      }
+      await stop(false);
     } finally {
       starting = false;
     }
   }
 
-  async function stop() {
+  async function stop(resetModes = true) {
     stopBtn.disabled = true;
+    connectedEl.hidden = true;
+    camActions.hidden = false;
     if (localStream) {
       for (const t of localStream.getTracks()) t.stop();
       localStream = null;
@@ -199,10 +301,29 @@
       ws.close();
       ws = null;
     }
-    document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = false; });
+    if (resetModes) {
+      document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = false; });
+    }
     startBtn.disabled = false;
-    setStatus("Stopped", "wait");
+    if (!camEl.hidden) setStatus("Stopped — tap Start when ready", "wait");
   }
+
+  function advancePastTrust() {
+    markCertDone();
+    const params = new URLSearchParams(location.search);
+    const t = (params.get("t") || params.get("token") || "").trim();
+    if (t) showCam(t);
+    else showGate();
+  }
+
+  trustDone.addEventListener("click", advancePastTrust);
+
+  certLink.addEventListener("click", () => {
+    // After download, nudge them toward Settings without leaving the page copy.
+    trustWarn.hidden = false;
+    trustWarn.dataset.state = "wait";
+    trustWarn.textContent = "Certificate downloading. Now open the Settings app and follow steps 2–6.";
+  });
 
   pairForm.addEventListener("submit", (e) => {
     e.preventDefault();
@@ -214,13 +335,18 @@
   });
 
   startBtn.addEventListener("click", start);
-  stopBtn.addEventListener("click", stop);
+  stopBtn.addEventListener("click", () => stop(true));
+  disconnectBtn.addEventListener("click", () => stop(true));
 
-  const params = new URLSearchParams(location.search);
-  const t = (params.get("t") || params.get("token") || "").trim();
-  if (t) {
-    showCam(t);
+  // Entry
+  if (!window.isSecureContext) {
+    showTrust("This page is not secure. Open the HTTPS link from your PC (scan the QR again).");
+  } else if (needsCertSetup()) {
+    showTrust();
   } else {
-    showGate();
+    const params = new URLSearchParams(location.search);
+    const t = (params.get("t") || params.get("token") || "").trim();
+    if (t) showCam(t);
+    else showGate();
   }
 })();

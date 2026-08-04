@@ -79,9 +79,9 @@ Listens on `https://0.0.0.0:8443` (`-addr` to change). First start writes a self
 1. iPhone Safari → `https://<pc-lan-ip>:8443/cert.cer` (accept the warning once to download).
 2. **Settings → Profile Downloaded** (or **General → VPN & Device Management**) → install **Tether Local CA**.
 3. **Settings → General → About → Certificate Trust Settings** → enable **Full Trust** for **Tether Local CA**.
-4. Quit Safari, open the **pairing URL** from the control page (includes `?t=…`).
+4. Quit Safari, open the pairing URL / scan the QR — the phone page walks through certificate trust in plain language (no README needed).
 
-If your LAN IP changes, `rm -rf certs`, restart, reinstall the CA.
+If your LAN IP changes, `rm -rf certs`, restart, reinstall the CA from the phone page.
 
 ## Pairing
 
