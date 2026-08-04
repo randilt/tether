@@ -58,23 +58,31 @@ Listens on `https://0.0.0.0:8443` (`-addr` to change). First start writes a self
 1. iPhone Safari → `https://<pc-lan-ip>:8443/cert.cer` (accept the warning once to download).
 2. **Settings → Profile Downloaded** (or **General → VPN & Device Management**) → install **Tether Local CA**.
 3. **Settings → General → About → Certificate Trust Settings** → enable **Full Trust** for **Tether Local CA**.
-4. Quit Safari, open `/phone`, Start camera.
+4. Quit Safari, open the **pairing URL** from the control page (includes `?t=…`), Start camera.
 
 If your LAN IP changes, `rm -rf certs`, restart, reinstall the CA.
 
-## Acceptance check (milestone 3)
+## Pairing (milestone 4)
 
-1. Load v4l2loopback, start `go run .`.
-2. Open `/control` on the PC.
-3. Connect two phones to `/phone` (optionally `?name=Kitchen` / `?name=Desk`).
-4. Both appear in the device list; first live phone becomes active (feeds `/dev/video10` + preview).
-5. Click the other device — preview and virtual cam switch without restarting the server.
-6. Disconnect the active phone — server stays up; another live phone is auto-selected if present.
+On each server start a random 6-character code is generated (printed in the terminal and shown on `/control`).
+
+- Phone must use `/phone?t=CODE` (or enter the code on `/phone`).
+- WebSocket joins without a matching `t` get **403**.
+- Code lasts for the process lifetime — restart → new code.
+- This is LAN hygiene, not real auth.
+
+## Acceptance check
+
+1. Load v4l2loopback, start `go run .`, note the pairing code.
+2. Open `/control` — code + phone URL visible; copy URL to phone.
+3. Phone with URL connects as before (multi-device picker still works).
+4. Another device opening `/phone` without the code cannot start a session (WS rejected).
+5. Optional: two phones with `?t=CODE&name=Kitchen` etc., switch active on control.
 
 ## Notes
 
 - LAN-only: no STUN/TURN (`iceServers: []`).
-- No auth, no mic, no packaging in this pass.
+- No accounts/passwords — just a process-lifetime pairing token.
 - Virtual cam path is H264-only (iPhone Safari). Browser preview relays the active device’s codec.
 - ffmpeg uses low-latency flags (`nobuffer`, `low_delay`, tiny probesize/analyzeduration).
 - **iPhone → Linux Chrome preview:** Chrome often can’t decode H264 → black `<video>`. Firefox usually works. OBS/Zoom use the v4l2 path.

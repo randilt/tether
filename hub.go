@@ -38,6 +38,8 @@ type signalMsg struct {
 	Message    string       `json:"message,omitempty"`
 	ID         string       `json:"id,omitempty"`
 	Devices    []deviceInfo `json:"devices,omitempty"`
+	Code       string       `json:"code,omitempty"`
+	URL        string       `json:"url,omitempty"`
 }
 
 type deviceInfo struct {
@@ -62,6 +64,7 @@ type device struct {
 type Hub struct {
 	api        *webrtc.API
 	v4l2Device string
+	pairCode   string
 
 	mu          sync.Mutex
 	devices     map[string]*device
@@ -72,7 +75,7 @@ type Hub struct {
 	controlGen  int
 }
 
-func newHub(v4l2Device string) (*Hub, error) {
+func newHub(v4l2Device, pairCode string) (*Hub, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, err
@@ -111,6 +114,7 @@ func newHub(v4l2Device string) (*Hub, error) {
 	return &Hub{
 		api:        api,
 		v4l2Device: v4l2Device,
+		pairCode:   pairCode,
 		devices:    make(map[string]*device),
 	}, nil
 }
@@ -123,6 +127,11 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	if rRole == roleViewer {
 		rRole = roleControl
+	}
+
+	if rRole == rolePhone && !h.validPairToken(r) {
+		http.Error(w, "pairing code required", http.StatusForbidden)
+		return
 	}
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -157,11 +166,19 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 			send(signalMsg{Type: "error", Message: err.Error()})
 		}
 	case roleControl:
-		if err := h.serveControl(ctx, conn, send); err != nil && !errors.Is(err, context.Canceled) {
+		if err := h.serveControl(ctx, r, conn, send); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("control session: %v", err)
 			send(signalMsg{Type: "error", Message: err.Error()})
 		}
 	}
+}
+
+func (h *Hub) validPairToken(r *http.Request) bool {
+	t := r.URL.Query().Get("t")
+	if t == "" {
+		t = r.URL.Query().Get("token")
+	}
+	return normalizePairCode(t) == normalizePairCode(h.pairCode)
 }
 
 func (h *Hub) servePhone(ctx context.Context, r *http.Request, conn *websocket.Conn, send func(signalMsg)) error {
@@ -347,12 +364,13 @@ func (h *Hub) handlePhoneSignal(pc *webrtc.PeerConnection, msg signalMsg, send f
 	return nil
 }
 
-func (h *Hub) serveControl(ctx context.Context, conn *websocket.Conn, send func(signalMsg)) error {
+func (h *Hub) serveControl(ctx context.Context, r *http.Request, conn *websocket.Conn, send func(signalMsg)) error {
 	h.mu.Lock()
 	h.controlGen++
 	gen := h.controlGen
 	h.controlSend = send
 	hasActive := h.activeLocalLocked() != nil
+	code := h.pairCode
 	h.mu.Unlock()
 
 	defer func() {
@@ -367,6 +385,11 @@ func (h *Hub) serveControl(ctx context.Context, conn *websocket.Conn, send func(
 		h.mu.Unlock()
 	}()
 
+	send(signalMsg{
+		Type: "pair",
+		Code: code,
+		URL:  phonePairURL(r.Host, code),
+	})
 	send(signalMsg{Type: "devices", Devices: h.snapshotDevices()})
 	if hasActive {
 		send(signalMsg{Type: "status", Message: "track-ready"})

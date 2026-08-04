@@ -1,4 +1,8 @@
 (() => {
+  const gateEl = document.getElementById("gate");
+  const camEl = document.getElementById("cam");
+  const pairForm = document.getElementById("pair-form");
+  const pairInput = document.getElementById("pair-input");
   const statusEl = document.getElementById("status");
   const preview = document.getElementById("preview");
   const startBtn = document.getElementById("start");
@@ -11,6 +15,7 @@
   /** @type {MediaStream | null} */
   let localStream = null;
   let starting = false;
+  let pairToken = "";
 
   function setStatus(text, state = "wait") {
     statusEl.textContent = text;
@@ -19,13 +24,27 @@
 
   function wsURL() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${proto}//${location.host}/ws?role=phone`;
+    const q = new URLSearchParams({ role: "phone", t: pairToken });
+    const name = new URLSearchParams(location.search).get("name");
+    if (name) q.set("name", name);
+    return `${proto}//${location.host}/ws?${q}`;
   }
 
   function send(msg) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
+  }
+
+  function showCam(token) {
+    pairToken = token.toUpperCase().trim();
+    gateEl.hidden = true;
+    camEl.hidden = false;
+  }
+
+  function showGate() {
+    gateEl.hidden = false;
+    camEl.hidden = true;
   }
 
   async function ensureWS() {
@@ -41,13 +60,20 @@
 
     ws = new WebSocket(wsURL());
     ws.addEventListener("message", onSignal);
-    ws.addEventListener("close", () => {
-      setStatus("Signaling disconnected", "error");
+    ws.addEventListener("close", (ev) => {
+      if (ev.code === 1008 || ev.code === 1006) {
+        setStatus("Pairing rejected — check the code on the PC", "error");
+      } else {
+        setStatus("Signaling disconnected", "error");
+      }
     });
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("ws timeout")), 8000);
       ws.addEventListener("open", () => { clearTimeout(t); resolve(); }, { once: true });
-      ws.addEventListener("error", () => { clearTimeout(t); reject(new Error("ws error")); }, { once: true });
+      ws.addEventListener("error", () => {
+        clearTimeout(t);
+        reject(new Error("WebSocket failed — wrong pairing code?"));
+      });
     });
   }
 
@@ -159,6 +185,23 @@
     setStatus("Stopped", "wait");
   }
 
+  pairForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const code = pairInput.value.trim().toUpperCase();
+    if (!code) return;
+    const url = new URL(location.href);
+    url.searchParams.set("t", code);
+    location.href = url.toString();
+  });
+
   startBtn.addEventListener("click", start);
   stopBtn.addEventListener("click", stop);
+
+  const params = new URLSearchParams(location.search);
+  const t = (params.get("t") || params.get("token") || "").trim();
+  if (t) {
+    showCam(t);
+  } else {
+    showGate();
+  }
 })();

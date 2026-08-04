@@ -4,6 +4,9 @@
   const remote = document.getElementById("remote");
   const listEl = document.getElementById("devices");
   const emptyEl = document.getElementById("device-empty");
+  const pairCodeEl = document.getElementById("pair-code");
+  const pairURLEl = document.getElementById("pair-url");
+  const copyBtn = document.getElementById("copy-url");
 
   /** @type {RTCPeerConnection | null} */
   let pc = null;
@@ -14,7 +17,7 @@
   let statsTimer = null;
   /** @type {Array<{id:string,name:string,capability:string,state:string,active:boolean}>} */
   let devices = [];
-
+  let pairURL = "";
   function setStatus(text, state = "wait") {
     statusEl.textContent = text;
     statusEl.dataset.state = state;
@@ -168,6 +171,15 @@
       return;
     }
 
+    if (msg.type === "pair") {
+      if (msg.code) pairCodeEl.textContent = msg.code;
+      if (msg.url) {
+        pairURL = msg.url;
+        pairURLEl.textContent = msg.url;
+      }
+      return;
+    }
+
     if (msg.type === "devices") {
       devices = Array.isArray(msg.devices) ? msg.devices : [];
       renderDevices();
@@ -233,6 +245,17 @@
       setStatus("WebSocket error", "error");
     });
   }
+
+  copyBtn.addEventListener("click", async () => {
+    if (!pairURL) return;
+    try {
+      await navigator.clipboard.writeText(pairURL);
+      copyBtn.textContent = "Copied";
+      setTimeout(() => { copyBtn.textContent = "Copy phone URL"; }, 1500);
+    } catch {
+      copyBtn.textContent = "Copy failed";
+    }
+  });
 
   connect();
 })();

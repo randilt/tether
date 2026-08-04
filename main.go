@@ -25,7 +25,12 @@ func main() {
 		log.Fatalf("cert: %v", err)
 	}
 
-	hub, err := newHub(*v4l2)
+	pairCode, err := generatePairCode()
+	if err != nil {
+		log.Fatalf("pair code: %v", err)
+	}
+
+	hub, err := newHub(*v4l2, pairCode)
 	if err != nil {
 		log.Fatalf("webrtc: %v", err)
 	}
@@ -48,7 +53,7 @@ func main() {
 		http.Redirect(w, r, "/control", http.StatusFound)
 	})
 
-	printURLs(*addr, *v4l2)
+	printURLs(*addr, *v4l2, pairCode)
 	log.Printf("listening on https://%s", *addr)
 	if err := http.ListenAndServeTLS(*addr, certPath, keyPath, mux); err != nil {
 		log.Fatal(err)
@@ -78,7 +83,7 @@ func serveCertDER(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func printURLs(addr, v4l2Device string) {
+func printURLs(addr, v4l2Device, pairCode string) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		port = "8443"
@@ -91,24 +96,25 @@ func printURLs(addr, v4l2Device string) {
 	fmt.Println()
 	fmt.Println("Tether — phone → WebRTC → v4l2")
 	fmt.Println("────────────────────────────────")
-	fmt.Printf("  PC control:  https://%s:%s/control\n", host, port)
-	fmt.Printf("  Phone page:  https://%s:%s/phone\n", host, port)
+	fmt.Printf("  Pairing code: %s\n", pairCode)
+	fmt.Printf("  PC control:   https://%s:%s/control\n", host, port)
+	fmt.Printf("  Phone (local): https://%s:%s/phone?t=%s\n", host, port, pairCode)
 	fmt.Printf("  Install cert: https://%s:%s/cert.cer\n", host, port)
 	if v4l2Device != "" {
-		fmt.Printf("  Virtual cam: %s\n", v4l2Device)
+		fmt.Printf("  Virtual cam:  %s\n", v4l2Device)
 		if _, err := os.Stat(v4l2Device); err != nil {
 			fmt.Printf("  WARNING: %s missing — load v4l2loopback (see README)\n", v4l2Device)
 		}
 	} else {
-		fmt.Println("  Virtual cam: disabled")
+		fmt.Println("  Virtual cam:  disabled")
 	}
 
 	for _, ip := range lanIPv4s() {
-		fmt.Printf("  Phone (LAN): https://%s:%s/phone\n", ip, port)
+		fmt.Printf("  Phone (LAN):  https://%s:%s/phone?t=%s\n", ip, port, pairCode)
 	}
 	fmt.Println()
-	fmt.Println("First time on iPhone: open /cert.cer, install the profile,")
-	fmt.Println("then enable Full Trust (see README).")
+	fmt.Println("Phones need the pairing code (or this URL). Code lasts until restart.")
+	fmt.Println("First time on iPhone: open /cert.cer, install + Full Trust (see README).")
 	fmt.Println()
 }
 

@@ -13,6 +13,15 @@
   </header>
   <main class="control-main">
     <aside class="device-panel">
+      <section class="pair-card">
+        <h2>Pairing</h2>
+        <p class="pair-code" id="pair-code">······</p>
+        <p class="pair-url" id="pair-url">Waiting for server…</p>
+        <div class="actions">
+          <button id="copy-url" type="button">Copy phone URL</button>
+        </div>
+        <p class="pair-hint">Phones open this URL (or enter the code on /phone). New code each server restart.</p>
+      </section>
       <h2>Devices</h2>
       <ul id="devices" class="device-list"></ul>
       <p id="device-empty" class="status" data-state="wait">No phones connected</p>
