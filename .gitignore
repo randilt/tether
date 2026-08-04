@@ -1,0 +1,6 @@
+/tether
+/certs/
+*.pem
+*.cer
+*.key
+*.exe

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Tether — Control</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Tether · Control</h1>
+    <p>Live preview of the phone camera. No virtual webcam yet.</p>
+  </header>
+  <main>
+    <div class="stage">
+      <video id="remote" playsinline autoplay></video>
+    </div>
+    <p id="status" class="status" data-state="wait">Connecting…</p>
+  </main>
+  <script src="/control.js"></script>
+</body>
+</html>

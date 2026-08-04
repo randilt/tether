@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Tether — Phone</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Tether · Phone</h1>
+    <p>Camera uplink to your PC over LAN WebRTC.</p>
+  </header>
+  <main>
+    <div class="stage">
+      <video id="preview" playsinline muted autoplay></video>
+    </div>
+    <p id="status" class="status" data-state="wait">Idle — tap Start to send camera.</p>
+    <div class="actions">
+      <button id="start" class="primary" type="button">Start camera</button>
+      <button id="stop" type="button" disabled>Stop</button>
+    </div>
+  </main>
+  <script src="/phone.js"></script>
+</body>
+</html>
