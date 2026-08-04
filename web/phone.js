@@ -19,6 +19,7 @@
   const disconnectBtn = document.getElementById("disconnect");
   const camActions = document.getElementById("cam-actions");
   const wakeFallback = document.getElementById("wake-fallback");
+  const orientPicker = document.getElementById("orient-picker");
 
   /** @type {RTCPeerConnection | null} */
   let pc = null;
@@ -44,6 +45,35 @@
   function selectedMode() {
     const el = document.querySelector('input[name="mode"]:checked');
     return el ? el.value : "video";
+  }
+
+  /** @returns {"portrait"|"landscape"} */
+  function selectedOrient() {
+    const el = document.querySelector('input[name="orient"]:checked');
+    return el && el.value === "landscape" ? "landscape" : "portrait";
+  }
+
+  function syncOrientPicker() {
+    if (!orientPicker) return;
+    orientPicker.hidden = selectedMode() === "audio";
+  }
+
+  async function lockPhoneOrient(orient) {
+    try {
+      const o = screen.orientation;
+      if (!o || typeof o.lock !== "function") return;
+      await o.lock(orient === "landscape" ? "landscape" : "portrait");
+    } catch {
+      /* iOS / unsigned sites often reject; physical rotate still works */
+    }
+  }
+
+  function unlockPhoneOrient() {
+    try {
+      screen.orientation?.unlock?.();
+    } catch {
+      /* ignore */
+    }
   }
 
   function setStatus(text, state = "wait") {
@@ -101,6 +131,7 @@
     connectedEl.hidden = true;
     camActions.hidden = false;
     headerSub.textContent = "Share camera or mic with your PC.";
+    syncOrientPicker();
   }
 
   function showConnected() {
@@ -109,6 +140,7 @@
     camActions.hidden = true;
     headerSub.textContent = "You’re all set.";
     document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = true; });
+    document.querySelectorAll('input[name="orient"]').forEach((el) => { el.disabled = true; });
     acquireWakeLock();
   }
 
@@ -200,11 +232,13 @@
     }
   }
 
-  function mediaConstraints(mode) {
+  function mediaConstraints(mode, orient) {
+    const landscape = orient === "landscape";
     const video = {
       facingMode: { ideal: "environment" },
-      width: { ideal: 1920 },
-      height: { ideal: 1080 },
+      width: { ideal: landscape ? 1920 : 1080 },
+      height: { ideal: landscape ? 1080 : 1920 },
+      aspectRatio: { ideal: landscape ? 16 / 9 : 9 / 16 },
       frameRate: { ideal: 30 },
     };
     if (mode === "audio") return { audio: true, video: false };
@@ -298,11 +332,27 @@
       for (const t of localStream.getTracks()) t.stop();
       localStream = null;
     }
-    localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints(selectedMode()));
+    const mode = selectedMode();
+    const orient = selectedOrient();
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints(mode, orient));
+    } catch (err) {
+      // Some browsers reject aspectRatio; retry with size ideals only.
+      if (mode !== "audio") {
+        const loose = mediaConstraints(mode, orient);
+        if (loose.video && typeof loose.video === "object") {
+          delete loose.video.aspectRatio;
+        }
+        localStream = await navigator.mediaDevices.getUserMedia(loose);
+      } else {
+        throw err;
+      }
+    }
     markCertDone();
     const hasVideo = localStream.getVideoTracks().length > 0;
     previewWrap.hidden = !hasVideo;
     preview.srcObject = hasVideo ? localStream : null;
+    if (hasVideo) await lockPhoneOrient(orient);
   }
 
   async function openWS(useResume) {
@@ -466,6 +516,7 @@
       await bindPeerAndOffer();
       stopBtn.disabled = false;
       document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = true; });
+      document.querySelectorAll('input[name="orient"]').forEach((el) => { el.disabled = true; });
       setStatus("Almost there…", "wait");
     } catch (err) {
       console.error(err);
@@ -510,6 +561,7 @@
     reconnectAttempt = 0;
     clearReconnectTimer();
     await releaseWakeLock();
+    unlockPhoneOrient();
     stopBtn.disabled = true;
     connectedEl.hidden = true;
     camActions.hidden = false;
@@ -522,6 +574,8 @@
     tearDownPeer();
     if (resetModes) {
       document.querySelectorAll('input[name="mode"]').forEach((el) => { el.disabled = false; });
+      document.querySelectorAll('input[name="orient"]').forEach((el) => { el.disabled = false; });
+      syncOrientPicker();
     }
     startBtn.disabled = false;
     if (!camEl.hidden) setStatus("Stopped — tap Start when ready", "wait");
@@ -550,6 +604,10 @@
     const url = new URL(location.href);
     url.searchParams.set("t", code);
     location.href = url.toString();
+  });
+
+  document.querySelectorAll('input[name="mode"]').forEach((el) => {
+    el.addEventListener("change", syncOrientPicker);
   });
 
   startBtn.addEventListener("click", start);

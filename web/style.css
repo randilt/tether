@@ -413,6 +413,11 @@ a.button.primary {
   cursor: pointer;
 }
 
+.mode-picker .orient-hint {
+  flex: 1 1 100%;
+  margin: 0;
+}
+
 .device-list {
   list-style: none;
   margin: 0;
@@ -465,6 +470,26 @@ body.view-page #remote {
   height: 100%;
   object-fit: contain;
   background: #000;
+}
+
+/* Fixed aspect stages for OBS Browser Source sizing hints */
+body.view-page.view-orient-landscape #remote,
+body.view-page.view-orient-portrait #remote {
+  inset: auto;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  object-fit: contain;
+}
+
+body.view-page.view-orient-landscape #remote {
+  width: min(100vw, calc(100vh * 16 / 9));
+  height: min(100vh, calc(100vw * 9 / 16));
+}
+
+body.view-page.view-orient-portrait #remote {
+  width: min(100vw, calc(100vh * 9 / 16));
+  height: min(100vh, calc(100vw * 16 / 9));
 }
 
 body.view-page .view-status {

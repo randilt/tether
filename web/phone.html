@@ -75,6 +75,14 @@
         <label><input type="radio" name="mode" value="audio" /> Microphone</label>
         <label><input type="radio" name="mode" value="av" /> Both</label>
       </fieldset>
+      <fieldset class="mode-picker" id="orient-picker">
+        <legend>Camera orientation</legend>
+        <label><input type="radio" name="orient" value="portrait" checked /> Portrait</label>
+        <label><input type="radio" name="orient" value="landscape" /> Landscape</label>
+        <p class="pair-hint orient-hint">
+          Landscape: rotate the phone sideways, then Start. Browsers follow how you hold the phone.
+        </p>
+      </fieldset>
       <div class="stage" id="preview-wrap">
         <video id="preview" playsinline muted autoplay></video>
       </div>

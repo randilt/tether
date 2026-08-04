@@ -52,9 +52,9 @@ go run . -control 127.0.0.1:9443 # custom control bind
 ## Quick path (OBS → Zoom)
 
 1. Start Tether; open `https://127.0.0.1:8444/control`.
-2. Pair a phone (QR / pairing URL); start camera.
-3. On the device row: **Copy OBS URL** (or **Open view**).
-4. OBS → Sources → **Browser Source** → paste the view URL (width/height e.g. 1280×720). Enable **Control audio via OBS** if you want mic.
+2. Pair a phone (QR / pairing URL); pick **Portrait** or **Landscape** on the phone (rotate sideways for landscape), then Start.
+3. On the device row: **Copy portrait** (9:16) or **Copy landscape** (16:9) — or Open the matching view.
+4. OBS → Sources → **Browser Source** → paste the URL. Size ≈ **1080×1920** (portrait) or **1920×1080** (landscape). Enable **Control audio via OBS** if you want mic.
 5. **Start Virtual Camera** in OBS → pick **OBS Virtual Camera** in Zoom/Teams.
 
 Same view URL works as a normal browser tab for **Window Capture**.

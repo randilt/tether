@@ -4,6 +4,11 @@
 
   const params = new URLSearchParams(location.search);
   const deviceID = (params.get("id") || "").trim();
+  const orientRaw = (params.get("orient") || "").toLowerCase();
+  const orient = orientRaw === "portrait" || orientRaw === "landscape" ? orientRaw : "";
+  if (orient) {
+    document.body.classList.add("view-orient-" + orient);
+  }
 
   /** @type {RTCPeerConnection | null} */
   let pc = null;
@@ -157,7 +162,9 @@
       setStatus("Missing ?id= device id");
       return;
     }
-    document.title = `Tether — ${deviceID}`;
+    document.title = orient
+      ? `Tether — ${deviceID} (${orient})`
+      : `Tether — ${deviceID}`;
     setStatus("Connecting…");
     ws = new WebSocket(wsURL());
     ws.addEventListener("message", onSignal);

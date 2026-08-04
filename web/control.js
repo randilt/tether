@@ -89,8 +89,35 @@
     codecStatus.textContent = `Preferred: ${preferredCodec === "vp8" ? "VP8" : "H.264"} (next phone connect/resume)`;
   }
 
-  function viewURL(id) {
-    return `${location.origin}/view?id=${encodeURIComponent(id)}`;
+  /** @param {"portrait"|"landscape"} orient */
+  function viewURL(id, orient) {
+    const u = new URL("/view", location.origin);
+    u.searchParams.set("id", id);
+    u.searchParams.set("orient", orient);
+    return u.toString();
+  }
+
+  function makeActionBtn(label, disabled, onClick) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.disabled = disabled;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      onClick(b);
+    });
+    return b;
+  }
+
+  async function copyURL(btn, url, idleLabel) {
+    try {
+      await navigator.clipboard.writeText(url);
+      btn.textContent = "Copied";
+      setTimeout(() => { btn.textContent = idleLabel; }, 1500);
+    } catch {
+      btn.textContent = "Copy failed";
+      setTimeout(() => { btn.textContent = idleLabel; }, 1500);
+    }
   }
 
   function wsURL() {
@@ -127,36 +154,23 @@
         setStatus(`Switching preview to ${d.name}…`, "wait");
       });
 
+      const live = d.state === "live";
       const actions = document.createElement("div");
       actions.className = "device-actions";
 
-      const openBtn = document.createElement("button");
-      openBtn.type = "button";
-      openBtn.textContent = "Open view";
-      openBtn.disabled = d.state !== "live";
-      openBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        window.open(viewURL(d.id), "_blank", "noopener");
-      });
+      actions.appendChild(makeActionBtn("Open portrait", !live, () => {
+        window.open(viewURL(d.id, "portrait"), "_blank", "noopener");
+      }));
+      actions.appendChild(makeActionBtn("Open landscape", !live, () => {
+        window.open(viewURL(d.id, "landscape"), "_blank", "noopener");
+      }));
+      actions.appendChild(makeActionBtn("Copy portrait", !live, (b) => {
+        copyURL(b, viewURL(d.id, "portrait"), "Copy portrait");
+      }));
+      actions.appendChild(makeActionBtn("Copy landscape", !live, (b) => {
+        copyURL(b, viewURL(d.id, "landscape"), "Copy landscape");
+      }));
 
-      const copyViewBtn = document.createElement("button");
-      copyViewBtn.type = "button";
-      copyViewBtn.textContent = "Copy OBS URL";
-      copyViewBtn.disabled = d.state !== "live";
-      copyViewBtn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const url = viewURL(d.id);
-        try {
-          await navigator.clipboard.writeText(url);
-          copyViewBtn.textContent = "Copied";
-          setTimeout(() => { copyViewBtn.textContent = "Copy OBS URL"; }, 1500);
-        } catch {
-          copyViewBtn.textContent = "Copy failed";
-        }
-      });
-
-      actions.appendChild(openBtn);
-      actions.appendChild(copyViewBtn);
       li.appendChild(btn);
       li.appendChild(actions);
       listEl.appendChild(li);
