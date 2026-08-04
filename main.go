@@ -17,6 +17,7 @@ var webFS embed.FS
 
 func main() {
 	addr := flag.String("addr", ":8443", "HTTPS listen address")
+	v4l2 := flag.String("v4l2", "/dev/video10", "v4l2loopback device (empty disables virtual cam)")
 	flag.Parse()
 
 	certPath, keyPath, err := ensureCert()
@@ -24,7 +25,7 @@ func main() {
 		log.Fatalf("cert: %v", err)
 	}
 
-	hub, err := newHub()
+	hub, err := newHub(*v4l2)
 	if err != nil {
 		log.Fatalf("webrtc: %v", err)
 	}
@@ -47,7 +48,7 @@ func main() {
 		http.Redirect(w, r, "/control", http.StatusFound)
 	})
 
-	printURLs(*addr)
+	printURLs(*addr, *v4l2)
 	log.Printf("listening on https://%s", *addr)
 	if err := http.ListenAndServeTLS(*addr, certPath, keyPath, mux); err != nil {
 		log.Fatal(err)
@@ -77,7 +78,7 @@ func serveCertDER(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
-func printURLs(addr string) {
+func printURLs(addr, v4l2Device string) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		port = "8443"
@@ -88,11 +89,19 @@ func printURLs(addr string) {
 	}
 
 	fmt.Println()
-	fmt.Println("Tether — milestone 1 (browser preview)")
-	fmt.Println("─────────────────────────────────────")
+	fmt.Println("Tether — phone → WebRTC → v4l2")
+	fmt.Println("────────────────────────────────")
 	fmt.Printf("  PC control:  https://%s:%s/control\n", host, port)
 	fmt.Printf("  Phone page:  https://%s:%s/phone\n", host, port)
 	fmt.Printf("  Install cert: https://%s:%s/cert.cer\n", host, port)
+	if v4l2Device != "" {
+		fmt.Printf("  Virtual cam: %s\n", v4l2Device)
+		if _, err := os.Stat(v4l2Device); err != nil {
+			fmt.Printf("  WARNING: %s missing — load v4l2loopback (see README)\n", v4l2Device)
+		}
+	} else {
+		fmt.Println("  Virtual cam: disabled")
+	}
 
 	for _, ip := range lanIPv4s() {
 		fmt.Printf("  Phone (LAN): https://%s:%s/phone\n", ip, port)

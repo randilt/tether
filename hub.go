@@ -14,6 +14,7 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"nhooyr.io/websocket"
 )
@@ -35,7 +36,8 @@ type signalMsg struct {
 }
 
 type Hub struct {
-	api *webrtc.API
+	api        *webrtc.API
+	v4l2Device string
 
 	mu         sync.Mutex
 	localTrack *webrtc.TrackLocalStaticRTP
@@ -44,7 +46,7 @@ type Hub struct {
 	viewerSend func(signalMsg) // set while viewer WS is live
 }
 
-func newHub() (*Hub, error) {
+func newHub(v4l2Device string) (*Hub, error) {
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
 		return nil, err
@@ -81,7 +83,7 @@ func newHub() (*Hub, error) {
 		webrtc.WithSettingEngine(se),
 	)
 
-	return &Hub{api: api}, nil
+	return &Hub{api: api, v4l2Device: v4l2Device}, nil
 }
 
 func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +182,8 @@ func (h *Hub) servePhone(ctx context.Context, conn *websocket.Conn, send func(si
 		if remote.Kind() != webrtc.RTPCodecTypeVideo {
 			return
 		}
-		log.Printf("phone track: %s %s", remote.Codec().MimeType, remote.ID())
+		mime := remote.Codec().MimeType
+		log.Printf("phone track: %s %s", mime, remote.ID())
 
 		local, err := webrtc.NewTrackLocalStaticRTP(
 			remote.Codec().RTPCodecCapability,
@@ -195,23 +198,56 @@ func (h *Hub) servePhone(ctx context.Context, conn *websocket.Conn, send func(si
 		h.mu.Lock()
 		h.localTrack = local
 		viewerSend := h.viewerSend
+		device := h.v4l2Device
 		h.mu.Unlock()
 
 		if viewerSend != nil {
 			viewerSend(signalMsg{Type: "status", Message: "track-ready"})
 		}
 
-		// Request keyframes so a late viewer can decode quickly.
+		// Keyframes ASAP for ffmpeg (needs SPS/PPS) and late viewers.
+		_ = pc.WriteRTCP([]rtcp.Packet{
+			&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())},
+		})
 		go pliLoop(ctx, pc, remote)
 
-		buf := make([]byte, 1500)
+		var cam *vcam
+		if device != "" && strings.Contains(strings.ToLower(mime), "h264") {
+			cam, err = startVCam(device)
+			if err != nil {
+				log.Printf("vcam: %v", err)
+			} else {
+				defer cam.Close()
+			}
+		} else if device != "" {
+			log.Printf("vcam: skip — need H264 for pipe, got %s", mime)
+		}
+
+		h264 := &codecs.H264Packet{}
 		for {
-			n, _, readErr := remote.Read(buf)
+			pkt, _, readErr := remote.ReadRTP()
 			if readErr != nil {
 				return
 			}
-			if _, err := local.Write(buf[:n]); err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				return
+
+			raw, mErr := pkt.Marshal()
+			if mErr == nil {
+				if _, err := local.Write(raw); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+					return
+				}
+			}
+
+			if cam == nil {
+				continue
+			}
+			nal, uErr := h264.Unmarshal(pkt.Payload)
+			if uErr != nil || len(nal) == 0 {
+				continue
+			}
+			if err := cam.Write(nal); err != nil {
+				log.Printf("vcam write: %v", err)
+				cam.Close()
+				cam = nil
 			}
 		}
 	})
